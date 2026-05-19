@@ -1101,8 +1101,8 @@ th.sort-desc::after { content: " ↓"; color: var(--accent-blue); }
       <span style="font-family:'Rajdhani','Cairo',sans-serif;font-weight:700;font-size:20px;color:#fff">EGX <span style="color:var(--accent-cyan)">Analyzer</span></span>
     </div>
     <div style="display:flex;gap:10px;align-items:center">
-      <button onclick="showLandingLogin()" style="background:transparent;border:1px solid rgba(99,179,237,0.3);color:var(--accent-blue);padding:8px 20px;border-radius:8px;cursor:pointer;font-family:Cairo,sans-serif;font-size:13px">دخول</button>
-      <button onclick="showLandingRegister()" style="background:linear-gradient(135deg,var(--accent-blue),var(--accent-purple));border:none;color:#fff;padding:8px 20px;border-radius:8px;cursor:pointer;font-family:Cairo,sans-serif;font-size:13px;font-weight:600">اشتراك مجاني</button>
+      <button onclick="guestEnter()" style="background:linear-gradient(135deg,var(--accent-blue),var(--accent-purple));border:none;color:#fff;padding:8px 20px;border-radius:8px;cursor:pointer;font-family:Cairo,sans-serif;font-size:13px;font-weight:600">🚀 دخول سريع</button>
+      <button onclick="showLandingLogin()" style="background:transparent;border:1px solid rgba(99,179,237,0.3);color:var(--accent-blue);padding:8px 20px;border-radius:8px;cursor:pointer;font-family:Cairo,sans-serif;font-size:13px">🔐 تسجيل دخول</button>
     </div>
   </header>
 
@@ -1112,8 +1112,8 @@ th.sort-desc::after { content: " ↓"; color: var(--accent-blue); }
     <h1 style="font-family:'Rajdhani','Cairo',sans-serif;font-size:44px;font-weight:700;margin:0 0 12px;color:#fff;letter-spacing:0.5px"><span style="color:var(--accent-cyan)">EGX Analyzer</span> — محلل البورصة المصرية</h1>
     <p style="font-size:18px;color:var(--text-secondary);max-width:600px;margin:0 0 32px;line-height:1.7">تحليل فني متقدم للأسهم المصرية • إشارات بيع وشراء ذكية • متابعة لحظية للفرص الاستثمارية</p>
     <div style="display:flex;gap:14px;flex-wrap:wrap;justify-content:center">
-      <button onclick="showLandingRegister()" style="background:linear-gradient(135deg,var(--accent-blue),var(--accent-purple));border:none;color:#fff;padding:14px 36px;border-radius:12px;cursor:pointer;font-family:Cairo,sans-serif;font-size:16px;font-weight:700">ابدأ مجانًا</button>
-      <button onclick="showLandingLogin()" style="background:rgba(99,179,237,0.08);border:1px solid rgba(99,179,237,0.25);color:var(--accent-blue);padding:14px 36px;border-radius:12px;cursor:pointer;font-family:Cairo,sans-serif;font-size:16px">تسجيل دخول</button>
+      <button onclick="guestEnter()" style="background:linear-gradient(135deg,var(--accent-blue),var(--accent-purple));border:none;color:#fff;padding:14px 36px;border-radius:12px;cursor:pointer;font-family:Cairo,sans-serif;font-size:16px;font-weight:700">🚀 دخول سريع</button>
+      <button onclick="showLandingLogin()" style="background:rgba(99,179,237,0.08);border:1px solid rgba(99,179,237,0.25);color:var(--accent-blue);padding:14px 36px;border-radius:12px;cursor:pointer;font-family:Cairo,sans-serif;font-size:16px">🔐 تسجيل دخول</button>
     </div>
   </section>
 
@@ -2191,14 +2191,11 @@ function showLoginModal() {
 }
 
 function showLandingLogin() {
-  // لو مفيش كلمة سر → ادخل مباشرة
-  if (!_hasPassword) { directEnter(); return; }
   document.getElementById('loginEmail').value = '';
   showLoginModal();
 }
 
 function showLandingRegister() {
-  if (!_hasPassword) { directEnter(); return; }
   document.getElementById('loginEmail').value = '';
   const reg = document.getElementById('registerFields');
   if (reg.style.display === 'none') toggleLoginRegister();
@@ -2206,24 +2203,20 @@ function showLandingRegister() {
   document.getElementById('loginError').textContent = '';
 }
 
-function directEnter() {
-  fetch('/api/auth/login', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({email:'admin@example.com', password:'x'})
-  }).then(r => r.json()).then(j => {
+async function guestEnter() {
+  // دخول سريع كضيف (role: user) — مش بيظهر تبويب الإدارة
+  try {
+    const r = await fetch('/api/auth/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({email:'guest@egx.local', password:'guest'})
+    });
+    const j = await r.json();
     if (j && j.ok && j.token) {
       setToken(j.token, true);
-      _userRole = j.role || 'user';
-      enterApp();
-      if (_userRole === 'admin') updateAdminUI();
-    } else {
-      // لو فشل الدخول المباشر (في كلمة سر) → اعرض شاشة الدخول
-      showLandingLogin();
     }
-  }).catch(() => {
-    // لو فشل الاتصال → ادخل app على طول
-    enterApp();
-  });
+  } catch(e) {}
+  _userRole = 'user';
+  enterApp();
 }
 
 let _hasPassword = false;
@@ -6148,17 +6141,10 @@ function checkNewSignals(data) {
     document.getElementById('landingPage').style.display = 'flex';
     document.getElementById('app').style.display = 'none';
   } else {
-    const t = getToken();
-    if (t) {
-      document.getElementById('landingPage').style.display = 'none';
-      document.getElementById('app').style.display = 'flex';
-      document.getElementById('loadingOverlay').style.display = 'flex';
-      init();
-    } else {
-      document.getElementById('loadingOverlay').style.display = 'none';
-      document.getElementById('landingPage').style.display = 'flex';
-      document.getElementById('app').style.display = 'none';
-    }
+    document.getElementById('landingPage').style.display = 'none';
+    document.getElementById('app').style.display = 'flex';
+    document.getElementById('loadingOverlay').style.display = 'flex';
+    guestEnter();
   }
 })();
 startAlertPolling();
