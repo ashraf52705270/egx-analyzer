@@ -1403,7 +1403,12 @@ async def login(body: LoginRequest):
     admin_hash = settings.get("password_hash")
     email = body.email.strip().lower()
 
-    # 0. وضع المستخدم الواحد (لا توجد كلمة مرور) — اسمح بالدخول المباشر
+    # 0. Guest login — role user (لا يظهر تبويب الإدارة)
+    if not admin_hash and email == 'guest@egx.local':
+        token = create_jwt_token(user_id=email, role="user")
+        return {"ok": True, "token": token, "role": "user", "guest": True}
+
+    # 1. وضع المستخدم الواحد (لا توجد كلمة مرور) — اسمح بالدخول المباشر
     if not admin_hash:
         token = create_jwt_token(user_id=email, role="admin")
         return {"ok": True, "token": token, "role": "admin", "single_user": True}
