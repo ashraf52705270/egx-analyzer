@@ -4479,9 +4479,38 @@ function targetCell(t, ep) {
     <div style="font-size:10px;color:var(--accent-green)">+${pct}%</div>
   </td>`;
 }
+let _tradeSort = { col: 'date', dir: -1 };
+
+function sortTrades(arr) {
+  const { col, dir } = _tradeSort;
+  return [...arr].sort((a, b) => {
+    let va, vb;
+    if (col === 'symbol') { va = a.symbol; vb = b.symbol; }
+    else if (col === 'entry') { va = a.entry_price || 0; vb = b.entry_price || 0; }
+    else if (col === 'pnl') {
+      va = (a.status === 'active' ? a.current_pnl_pct : a.pnl_pct) || 0;
+      vb = (b.status === 'active' ? b.current_pnl_pct : b.pnl_pct) || 0;
+    }
+    else { va = a.entry_date || ''; vb = b.entry_date || ''; }
+    if (typeof va === 'string') return va.localeCompare(vb) * dir;
+    return (va - vb) * dir;
+  });
+}
+
+function setTradeSort(col) {
+  if (_tradeSort.col === col) _tradeSort.dir *= -1;
+  else { _tradeSort.col = col; _tradeSort.dir = -1; }
+  renderTrades();
+}
+
+function sortArrow(col) {
+  if (_tradeSort.col !== col) return '';
+  return _tradeSort.dir === -1 ? ' 🔽' : ' 🔼';
+}
+
 function renderTrades() {
   loadTradesData().then(() => {
-    const open   = _trades.filter(t => t.status === 'active');
+    const open   = sortTrades(_trades.filter(t => t.status === 'active'));
     const closed = _trades.filter(t => t.status === 'closed');
     const totalPnl = closed.reduce((s,t) => s + (t.pnl_egp||0), 0);
     const wins     = closed.filter(t => (t.pnl_egp||0) > 0).length;
@@ -4502,12 +4531,12 @@ function renderTrades() {
     // رسم بياني
     renderTradesChart(_trades);
 
-    if (!_trades.length) {
+    if (!open.length) {
       document.getElementById('tradesTable').innerHTML = `
         <div class="empty-state">
           <div class="empty-icon">📋</div>
-          <p>لا توجد صفقات مسجلة</p>
-          <p style="font-size:12px;margin-top:8px">اضغط "إضافة صفقة" أو افتح تفاصيل أي سهم وستجد زر تسجيل الصفقة</p>
+          <p>لا توجد صفقات مفتوحة</p>
+          <p style="font-size:12px;margin-top:8px">كل الصفقات المغلقة موجودة في تبويب الباك تست</p>
         </div>`;
       return;
     }
@@ -4515,16 +4544,16 @@ function renderTrades() {
     document.getElementById('tradesTable').innerHTML = `
       <table style="width:100%;border-collapse:collapse">
         <thead><tr>
-          <th style="padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border)">الرمز</th>
-          <th style="padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border)">الدخول</th>
-          <th style="padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border)">الربح/خسارة</th>
+          <th onclick="setTradeSort('symbol')" style="cursor:pointer;padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border);user-select:none">الرمز${sortArrow('symbol')}</th>
+          <th onclick="setTradeSort('entry')" style="cursor:pointer;padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border);user-select:none">الدخول${sortArrow('entry')}</th>
+          <th onclick="setTradeSort('pnl')" style="cursor:pointer;padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border);user-select:none">الربح/خسارة${sortArrow('pnl')}</th>
           <th style="padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border)">الوقف</th>
           <th colspan="3" style="padding:10px 14px;text-align:center;font-size:12px;color:var(--accent-green);background:var(--bg-secondary);border-bottom:1px solid var(--border)">🎯 الأهداف القريبة</th>
           <th colspan="3" style="padding:10px 14px;text-align:center;font-size:12px;color:var(--accent-cyan);background:var(--bg-secondary);border-bottom:1px solid var(--border)">🏆 الأهداف البعيدة</th>
-          <th style="padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border)">التاريخ</th>
+          <th onclick="setTradeSort('date')" style="cursor:pointer;padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border);user-select:none">التاريخ${sortArrow('date')}</th>
           <th style="padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border)">إجراء</th>
         </tr></thead>
-        <tbody>${_trades.map(tr => {
+        <tbody>${open.map(tr => {
           const isOpen = tr.status === 'active';
       let pnlPct  = isOpen ? tr.current_pnl_pct : tr.pnl_pct;
       let pnlEgp  = isOpen ? tr.current_pnl_egp  : tr.pnl_egp;
@@ -5583,7 +5612,7 @@ async function renderBacktest() {
     for (const sig of j.recent) {
       const isWin = sig.result === 'WIN';
       const color = isWin ? 'var(--accent-green)' : '#ff1744';
-      html += `<tr style="border-bottom:1px solid var(--border)">
+      html += `<tr onclick="showTradeDetail(${sig.db_id})" style="border-bottom:1px solid var(--border);cursor:pointer" onmouseover="this.style.background='var(--bg-secondary)'" onmouseout="this.style.background=''">
         <td style="padding:5px 8px;font-weight:700">${sig.symbol}</td>
         <td style="padding:5px 8px">${sig.entry_price || '-'}</td>
         <td style="padding:5px 8px">${sig.exit_price || '-'}</td>
@@ -5599,10 +5628,131 @@ async function renderBacktest() {
   } catch(e) { document.getElementById('backtestTable').innerHTML = '<div style="padding:20px;color:var(--accent-red)">خطأ في تحميل الباك تيست</div>'; }
 }
 
+// ── عرض تفاصيل صفقة مقفولة ──
+async function showTradeDetail(signalLogId) {
+  try {
+    const r = await fetchWithTimeout(`/api/backtest/trade/${signalLogId}`, 10000);
+    const j = await r.json();
+    if (!j.ok) { alert(j.detail || 'خطأ'); return; }
+
+    const tr = j.trade;
+    const ev = j.events || [];
+
+    const ep = tr.entry_price || 0;
+    const isWin = tr.result === 'WIN';
+    const pnlColor = isWin ? 'var(--accent-green)' : '#ff1744';
+    const pnlSign = (tr.pnl||0) >= 0 ? '+' : '';
+
+    // تفاصيل الأهداف
+    const targets = [
+      { label: 'ق1', price: tr.near_t1, pct: tr.near_p1, shares: tr.q_n1 },
+      { label: 'ق2', price: tr.near_t2, pct: tr.near_p2, shares: tr.q_n2 },
+      { label: 'ق3', price: tr.near_t3, pct: tr.near_p3, shares: tr.q_n3 },
+      { label: 'ب1', price: tr.far_t1, pct: null, shares: tr.q_f1 },
+      { label: 'ب2', price: tr.far_t2, pct: null, shares: tr.q_f2 },
+    ];
+
+    const targetRows = targets.map(t => `
+      <tr>
+        <td style="padding:3px 8px;font-weight:700">${t.label}</td>
+        <td style="padding:3px 8px;direction:ltr;text-align:right">${t.price || '-'}</td>
+        <td style="padding:3px 8px">${t.pct != null ? `+${t.pct}%` : '-'}</td>
+        <td style="padding:3px 8px">${t.shares || 0}</td>
+      </tr>
+    `).join('');
+
+    // الأحداث (جني أرباح، وقف متحرك)
+    const eventRows = ev.map(e => {
+      const labels = {
+        CLOSE_T1: '🎯 جنى ق1', CLOSE_T2: '🎯 جنى ق2', CLOSE_T3: '🏆 جنى ق3',
+        CLOSE_FAR1: '🏆 جنى ب1', CLOSE_FAR2: '🏆 جنى ب2',
+        TRAIL_STOP: '📌 حرّك الوقف', CLOSE_STOP: '🛑 وقف خسارة',
+      };
+      return `<tr>
+        <td style="padding:3px 8px">${labels[e.action] || e.action}</td>
+        <td style="padding:3px 8px;direction:ltr">${e.price || '-'}</td>
+        <td style="padding:3px 8px;font-size:10px">${e.reason || ''}</td>
+        <td style="padding:3px 8px;font-size:10px">${e.created_at ? new Date(e.created_at).toLocaleString('ar-EG') : ''}</td>
+      </tr>`;
+    }).join('');
+
+    const html = `
+      <div class="modal-overlay" onclick="closeTradeDetail(event)">
+        <div class="modal-content" style="max-width:650px;max-height:90vh;overflow-y:auto;text-align:right"
+             onclick="event.stopPropagation()">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <h3 style="margin:0;color:var(--accent-blue)">${tr.symbol} — ${tr.name||''}</h3>
+            <span onclick="closeTradeDetail()" style="cursor:pointer;font-size:22px;color:var(--text-muted)">&times;</span>
+          </div>
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;font-size:13px">
+            <div><span style="color:var(--text-muted)">الدخول:</span> <b>${ep} ج</b></div>
+            <div><span style="color:var(--text-muted)">الخروج:</span> <b>${tr.exit_price || '-'} ج</b></div>
+            <div><span style="color:var(--text-muted)">وقف الخسارة:</span> <b style="color:var(--accent-red)">${tr.stop_loss || '-'} ج</b></div>
+            <div><span style="color:var(--text-muted)">النتيجة:</span> <b style="color:${pnlColor}">${tr.result} (${pnlSign}${tr.pnl_pct||0}%)</b></div>
+            <div><span style="color:var(--text-muted)">الربح:</span> <b style="color:${pnlColor}">${pnlSign}${(tr.pnl||0).toFixed(2)} ج</b></div>
+            <div><span style="color:var(--text-muted)">السبب:</span> <b>${tr.exit_reason || '-'}</b></div>
+            <div><span style="color:var(--text-muted)">سيناريو الدخول:</span> <b>${tr.entry_scenario || '-'}</b></div>
+            <div><span style="color:var(--text-muted)">التاريخ:</span> <b>${tr.created_at ? new Date(tr.created_at).toLocaleString('ar-EG') : '-'}</b></div>
+          </div>
+
+          <div style="background:var(--bg-secondary);border-radius:8px;padding:10px;margin-bottom:12px">
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">سبب الإشارة:</div>
+            <div style="font-size:13px">${tr.reason || '—'}</div>
+          </div>
+
+          <h4 style="margin:0 0 6px;font-size:13px;color:var(--accent-green)">🎯 خطة الأهداف</h4>
+          <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:12px">
+            <thead><tr style="background:var(--bg-secondary);font-weight:700">
+              <th style="padding:4px 8px;text-align:right">الهدف</th>
+              <th style="padding:4px 8px;text-align:right">السعر</th>
+              <th style="padding:4px 8px;text-align:right">%</th>
+              <th style="padding:4px 8px;text-align:right">الأسهم</th>
+            </tr></thead>
+            <tbody>${targetRows}</tbody>
+          </table>
+
+          ${ev.length ? `
+          <h4 style="margin:0 0 6px;font-size:13px;color:var(--accent-cyan)">📋 الأحداث</h4>
+          <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:12px">
+            <thead><tr style="background:var(--bg-secondary);font-weight:700">
+              <th style="padding:4px 8px;text-align:right">الحدث</th>
+              <th style="padding:4px 8px;text-align:right">السعر</th>
+              <th style="padding:4px 8px;text-align:right">السبب</th>
+              <th style="padding:4px 8px;text-align:right">الوقت</th>
+            </tr></thead>
+            <tbody>${eventRows}</tbody>
+          </table>` : ''}
+
+          <div style="background:var(--bg-secondary);border-radius:8px;padding:10px;margin-bottom:8px;max-height:200px;overflow-y:auto;font-size:11px;line-height:1.6;white-space:pre-wrap;direction:ltr;text-align:left;font-family:monospace">
+            ${(tr.text || '').replace(/\n/g, '<br>')}
+          </div>
+        </div>
+      </div>
+    `;
+
+    const existing = document.getElementById('tradeDetailModal');
+    if (existing) existing.remove();
+
+    const div = document.createElement('div');
+    div.id = 'tradeDetailModal';
+    div.innerHTML = html;
+    document.body.appendChild(div);
+  } catch(e) {
+    alert('خطأ في تحميل تفاصيل الصفقة');
+  }
+}
+
+function closeTradeDetail(e) {
+  if (e && e.target !== e.currentTarget) return;
+  const el = document.getElementById('tradeDetailModal');
+  if (el) el.remove();
+}
+
 function renderAutoSignals() {
   const el = document.getElementById('autoSignalsList');
   if (!el) return;
-  const log = _autoLog.slice(0, 50);
+  const log = _autoLog.filter(s => s.action === 'OPEN').slice(0, 50);
   if (!log.length) {
     el.innerHTML = `<div class="empty-state">
       <div class="empty-icon">🤖</div>

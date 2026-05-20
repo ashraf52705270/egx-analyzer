@@ -365,9 +365,15 @@ class DecisionEngine:
                 if reason:
                     logger.info("  [رفض] %s ← %s", sym, reason)
 
+            # منع إعادة فتح صفقة لنفس السهم لو في صفقة سابقة (أوتوماتيك)
+            existing_trade_for_sym = any(
+                tr.get("symbol") == sym and tr.get("auto")
+                for tr in trades
+            )
             if (
                 settings.get("auto_open")
                 and sym not in open_trades
+                and not existing_trade_for_sym
                 and sig_type in BUY_SIGNALS
                 and tq >= min_quality
                 and rr1_val >= min_rr
@@ -734,6 +740,18 @@ class DecisionEngine:
         q_f1 = int(shares * 0.30)
         q_f2 = shares - q_n1 - q_n2 - q_n3 - q_f1
 
+        # استخدام وقت الإشارة الأصلي من السجل إن وجد
+        if signal_log_id:
+            from database import SignalLog as SLModel, get_session
+            try:
+                with get_session() as session:
+                    sl = session.query(SLModel).filter(SLModel.id == signal_log_id).first()
+                    signal_created = sl.created_at.isoformat() if sl and sl.created_at else None
+            except Exception:
+                signal_created = None
+        else:
+            signal_created = None
+
         new_trade: Dict[str, Any] = {
             "symbol":         sym,
             "entry_price":    entry_p,
@@ -759,11 +777,11 @@ class DecisionEngine:
             "trade_quality":  round(tq, 1),
             "signal_type":    a.get("signal_type", ""),
             "entry_scenario": t.get("entry_scenario", "WAIT"),
-            "notes":          f"تلقائي — {a.get('signal', '')} — جودة {round(tq, 0)}",
+            "notes":          {"text": f"تلقائي — {a.get('signal', '')} — جودة {round(tq, 0)}"},
             "status":         "active",
             "auto":           True,
             "signal_log_id":  signal_log_id,
-            "entry_date":     (cairo_now() + timedelta(seconds=seq)).isoformat(),
+            "entry_date":     signal_created or (cairo_now() + timedelta(seconds=seq)).isoformat(),
             "exit_date":      None,
             "exit_price":     None,
             "pnl_pct":        None,

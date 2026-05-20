@@ -876,19 +876,19 @@ async def get_trades():
     for tr in trades:
         if tr.get("status") == "active":
             sym = tr.get("symbol", "")
-            stock_data = stocks.get(sym)
-            if stock_data:
-                cur = stock_data.price if hasattr(stock_data, "price") else None
-            else:
-                cur = None
-            tr["current_price"] = cur
-            if cur and tr.get("entry_price"):
-                tr["current_pnl_pct"] = round(
-                    (cur - tr["entry_price"]) / tr["entry_price"] * 100, 2
-                )
-                tr["current_pnl_egp"] = round(
-                    (cur - tr["entry_price"]) * tr.get("shares", 0), 2
-                )
+        stock_data = stocks.get(sym)
+        if stock_data:
+            cur = stock_data.price if hasattr(stock_data, "price") else None
+        else:
+            cur = None
+        tr["current_price"] = cur
+        if cur and tr.get("entry_price"):
+            tr["current_pnl_pct"] = round(
+                (cur - tr["entry_price"]) / tr["entry_price"] * 100, 2
+            )
+            tr["current_pnl_egp"] = round(
+                (cur - tr["entry_price"]) * tr.get("shares", 0), 2
+            )
 
     return {"ok": True, "trades": trades, "count": len(trades)}
 
@@ -1152,7 +1152,65 @@ async def get_backtest(user: Dict = Depends(require_premium)):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 21. GET /api/breadth — تحليل اتساع السوق
+# 21. GET /api/backtest/trade/{signal_log_id} — تفاصيل صفقة مقفولة
+# Closed trade details
+# ═══════════════════════════════════════════════════════════════
+
+
+@router.get("/api/backtest/trade/{signal_log_id}")
+async def get_backtest_trade(signal_log_id: int, user: Dict = Depends(require_premium)):
+    """جلب تفاصيل الصفقة المقفولة مع جميع الأحداث (جني أرباح، وقف متحرك)"""
+    from database import SignalLog as SignalLogModel, get_session
+    from sqlalchemy import and_
+
+    signals = load_signals_log(limit=500)
+    main_signal = None
+    for s in signals:
+        if s.get("db_id") == signal_log_id and s.get("action") == "OPEN":
+            main_signal = s
+            break
+
+    if not main_signal:
+        raise HTTPException(status_code=404, detail="لم يتم العثور على الصفقة")
+
+    symbol = main_signal.get("symbol", "")
+    open_time = main_signal.get("created_at")
+
+    # جلب الأحداث المرتبطة (جني أرباح، وقف متحرك) — بنفس الرمز بعد وقت الفتح
+    sub_entries = []
+    try:
+        with get_session() as session:
+            rows = (
+                session.query(SignalLogModel)
+                .filter(
+                    and_(
+                        SignalLogModel.symbol == symbol,
+                        SignalLogModel.action.in_([
+                            "CLOSE_T1", "CLOSE_T2", "CLOSE_T3",
+                            "CLOSE_FAR1", "CLOSE_FAR2",
+                            "TRAIL_STOP", "CLOSE_STOP",
+                        ]),
+                    )
+                )
+                .order_by(SignalLogModel.created_at.asc())
+                .all()
+            )
+            for row in rows:
+                rd = row.to_dict()
+                if rd.get("created_at", "") >= open_time:
+                    sub_entries.append(rd)
+    except Exception as e:
+        logger.warning("فشل جلب الأحداث المرتبطة: %s", e)
+
+    return {
+        "ok": True,
+        "trade": main_signal,
+        "events": sub_entries,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# 22. GET /api/breadth — تحليل اتساع السوق
 # Market breadth analysis
 # ═══════════════════════════════════════════════════════════════
 

@@ -211,6 +211,8 @@ class Trade(Base):
         targets_raw = self.targets
         notes_raw = self.notes
         near_raw = self.near_targets
+        _near = json.loads(near_raw) if near_raw else []
+        _far = json.loads(targets_raw) if targets_raw else []
         return {
             "id": self.id,
             "symbol": self.symbol,
@@ -231,8 +233,13 @@ class Trade(Base):
             "q_f1_open": self.q_f1_open,
             "q_f2_open": self.q_f2_open,
             "stop_loss": self.stop_loss,
-            "targets": json.loads(targets_raw) if targets_raw else [],
-            "near_targets": json.loads(near_raw) if near_raw else [],
+            "near_t1": _near[0] if len(_near) > 0 else None,
+            "near_t2": _near[1] if len(_near) > 1 else None,
+            "near_t3": _near[2] if len(_near) > 2 else None,
+            "far_t1": _far[0] if len(_far) > 0 else None,
+            "far_t2": _far[1] if len(_far) > 1 else None,
+            "targets": _far,
+            "near_targets": _near,
             "status": self.status,
             "pnl": self.pnl,
             "pnl_egp": self.pnl,
@@ -242,6 +249,7 @@ class Trade(Base):
             "entry_date": self.entry_date.isoformat() if self.entry_date else None,
             "exit_date": self.exit_date.isoformat() if self.exit_date else None,
             "notes": json.loads(notes_raw) if notes_raw else {},
+            "auto": self.signal_log_id is not None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -300,8 +308,9 @@ class SignalLog(Base):
                 card = _json.loads(self.card_data)
             except Exception:
                 pass
-        return {
+        result = {
             "id": self.id,
+            "db_id": self.id,
             "symbol": self.symbol,
             "action": self.action,
             "price": self.price,
@@ -322,8 +331,9 @@ class SignalLog(Base):
             "exit_reason": self.exit_reason,
             "exit_date": self.exit_date.isoformat() if self.exit_date else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
-            **card,
         }
+        result.update(card)
+        return result
 
 
 class SentSignal(Base):
@@ -651,6 +661,27 @@ def _dict_to_trade(data: Dict[str, Any]) -> Trade:
     raw_near = data.get("near_targets")
     if not raw_near:
         raw_near = [t for t in [data.get("near_t1"), data.get("near_t2"), data.get("near_t3")] if t is not None]
+    entry_dt = None
+    raw = data.get("entry_date")
+    if raw:
+        try:
+            entry_dt = datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            entry_dt = None
+    exit_dt = None
+    raw = data.get("exit_date")
+    if raw:
+        try:
+            exit_dt = datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            exit_dt = None
+    # تخزين auto في الـ notes للحفاظ عليه عبر دورة الحفظ
+    notes_val = data.get("notes", {})
+    if isinstance(notes_val, str):
+        try:
+            notes_val = json.loads(notes_val)
+        except (json.JSONDecodeError, TypeError):
+            notes_val = {}
     return Trade(
         symbol=data.get("symbol", ""),
         entry_price=data.get("entry_price", 0.0),
@@ -677,7 +708,9 @@ def _dict_to_trade(data: Dict[str, Any]) -> Trade:
         pnl_pct=data.get("pnl_pct", 0.0),
         exit_price=data.get("exit_price"),
         exit_reason=data.get("exit_reason"),
-        notes=json.dumps(data.get("notes", {})) if data.get("notes") else None,
+        entry_date=entry_dt,
+        exit_date=exit_dt,
+        notes=json.dumps(notes_val) if notes_val else None,
     )
 
 
