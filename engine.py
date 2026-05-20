@@ -99,6 +99,12 @@ class DecisionEngine:
         self._signals: List[Dict[str, Any]] = []
         self._signals_lock = threading.Lock()
 
+        # حالة السوق — كشف الصرف/التجميع الجماعي
+        self._market_distribution: Dict[str, Any] = {
+            "state": "عادي", "distribution": False, "accumulation": False,
+            "severity": 0, "level": "عادي", "advancing_pct": 50, "warnings": [],
+        }
+
         # تتبع الخسارة اليومية
         self._daily_pnl: float = 0.0
         self._daily_pnl_date: str = ""
@@ -146,6 +152,11 @@ class DecisionEngine:
             raise ValueError(f"وضع تداول غير صالح: '{value}'. الأوضاع المتاحة: auto, semi_auto, manual")
         self._mode = value
         logger.info("تم تغيير وضع التداول إلى: %s", value)
+
+    @property
+    def market_distribution(self) -> Dict[str, Any]:
+        """حالة صرف السوق الحالية"""
+        return self._market_distribution
 
     @property
     def daily_loss_limit(self) -> float:
@@ -293,6 +304,22 @@ class DecisionEngine:
         if not settings.get("auto_open") and not settings.get("auto_close"):
             return
 
+        # كشف الصرف/التجميع الجماعي
+        self._market_distribution = detect_market_distribution(stocks)
+        dist = self._market_distribution
+        if dist["distribution"]:
+            logger.warning(
+                "⚠️ صرف جماعي في السوق (الشدة: %d/%d) — %s",
+                dist["severity"], 5, " | ".join(dist["warnings"]),
+            )
+            if dist["severity"] >= 4:
+                logger.warning("🚫 تعليق فتح صفقات جديدة بسبب الصرف الجماعي الشديد")
+        elif dist["accumulation"]:
+            logger.info(
+                "✅ تجميع سوقي (الشدة: %d/5) — وقت مناسب لفتح صفقات",
+                dist["severity"],
+            )
+
         # تحميل الإعدادات والصفقات
         trades = load_trades()
         open_trades = {tr["symbol"]: tr for tr in trades if tr.get("status") == "active"}
@@ -304,6 +331,19 @@ class DecisionEngine:
         min_confirm = settings.get("min_confirm", DEFAULT_MIN_CONFIRMATION)
         min_adx     = settings.get("min_adx", DEFAULT_MIN_ADX)
         min_rel_vol = settings.get("min_rel_vol", DEFAULT_MIN_REL_VOL)
+
+        # تخفيف العتبات أثناء التجميع السوقي
+        if dist["accumulation"] and dist["severity"] >= 3:
+            min_quality = max(50, min_quality - 10)
+            min_rr      = max(1.2, min_rr - 0.3)
+            min_liq     = max(25, min_liq - 10)
+            min_confirm = max(2, min_confirm - 1)
+            min_adx     = max(12, min_adx - 5)
+            min_rel_vol = max(0.3, min_rel_vol - 0.2)
+            logger.info("✅ تخفيف عتبات الدخول بسبب التجميع السوقي (جودة≥%d, RR≥%.1f)", min_quality, min_rr)
+
+        # منع فتح صفقات أثناء الصرف الشديد (بعد العتبات المعدلة)
+        block_new = dist["distribution"] and dist["severity"] >= 4
 
         changed = False
         opened_this_cycle: set = set()
@@ -370,10 +410,16 @@ class DecisionEngine:
                 tr.get("symbol") == sym and tr.get("auto")
                 for tr in trades
             )
+            # منع فتح صفقات جديدة أثناء الصرف الجماعي الشديد
+            if block_new and sig_type in BUY_SIGNALS and sym not in open_trades:
+                if not reason:
+                    logger.info("  [رفض] %s ← صرف جماعي في السوق (severity=%d)", sym, self._market_distribution["severity"])
+
             if (
                 settings.get("auto_open")
                 and sym not in open_trades
                 and not existing_trade_for_sym
+                and not block_new
                 and sig_type in BUY_SIGNALS
                 and tq >= min_quality
                 and rr1_val >= min_rr
@@ -1097,6 +1143,178 @@ class DecisionEngine:
         """
         with self._signals_lock:
             return list(self._signals[:limit])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# كشف الصرف الجماعي في السوق
+# Market Distribution / Dump Detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_market_distribution(stocks: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    كشف حالة السوق: صرف جماعي / تجميع / عادي
+    - Market Breadth (نسبة الأسهم الصاعدة/الهابطة)
+    - الأسهم فوق/تحت سعر الفتح
+    - حجم مرتفع مع نزول (صرف) أو صعود (تجميع)
+    - الأسهم قرب أدنى/أعلى اليوم
+    """
+    total = len(stocks)
+    if total == 0:
+        return {"distribution": False, "accumulation": False, "severity": 0, "advancing_pct": 50}
+
+    advancing = 0
+    declining = 0
+    below_open = 0
+    above_open = 0
+    volume_surge_red = 0
+    volume_surge_green = 0
+    near_day_low = 0
+    near_day_high = 0
+
+    for sym, v in stocks.items():
+        price = v.get("price", 0)
+        chg = v.get("change_pct", 0) or 0
+
+        if chg > 0:
+            advancing += 1
+        elif chg < 0:
+            declining += 1
+
+        chg_from_open = v.get("chg_from_open", 0) or 0
+        if chg_from_open < -1:
+            below_open += 1
+        elif chg_from_open > 1:
+            above_open += 1
+
+        rel_vol = (v.get("volume", 0) / v.get("avg_vol", 1)) if (v.get("avg_vol") or 0) > 0 else 0
+        if rel_vol > 1.5 and chg < -1:
+            volume_surge_red += 1
+        elif rel_vol > 1.5 and chg > 1:
+            volume_surge_green += 1
+
+        day_high = v.get("day_high", 0)
+        day_low = v.get("day_low", 0)
+        if day_high and day_low and price and (day_high - day_low) > 0:
+            pos_in_range = (price - day_low) / (day_high - day_low)
+            if pos_in_range < 0.3 and chg < 0:
+                near_day_low += 1
+            elif pos_in_range > 0.7 and chg > 0:
+                near_day_high += 1
+
+    advancing_pct = advancing / total * 100
+    declining_pct = declining / total * 100
+    below_open_pct = below_open / total * 100
+    above_open_pct = above_open / total * 100
+    surge_red_pct = volume_surge_red / total * 100
+    surge_green_pct = volume_surge_green / total * 100
+    near_low_pct = near_day_low / total * 100
+    near_high_pct = near_day_high / total * 100
+
+    # — صرف جماعي —
+    dist_severity = 0
+    dist_warnings = []
+
+    if advancing_pct < 25:
+        dist_severity += 4
+        dist_warnings.append("أقل من 25% من الأسهم صاعدة — صرف جماعي شديد")
+    elif advancing_pct < 35:
+        dist_severity += 3
+        dist_warnings.append(f"أقل من 35% من الأسهم صاعدة ({advancing_pct:.0f}%)")
+    elif advancing_pct < 45:
+        dist_severity += 2
+        dist_warnings.append(f"نسبة الأسهم الصاعدة منخفضة ({advancing_pct:.0f}%)")
+    elif advancing_pct < 55:
+        dist_severity += 1
+
+    if below_open_pct > 60:
+        dist_severity += 3
+        dist_warnings.append(f"أكثر من 60% من الأسهم تحت سعر الفتح ({below_open_pct:.0f}%)")
+    elif below_open_pct > 40:
+        dist_severity += 1
+
+    if surge_red_pct > 15:
+        dist_severity += 2
+        dist_warnings.append(f"{surge_red_pct:.0f}% من الأسهم تنزل بحجم مرتفع")
+    elif surge_red_pct > 8:
+        dist_severity += 1
+
+    if near_low_pct > 30:
+        dist_severity += 2
+        dist_warnings.append(f"{near_low_pct:.0f}% من الأسهم قرب أدنى اليوم")
+    elif near_low_pct > 20:
+        dist_severity += 1
+
+    distribution = dist_severity >= 3
+    dist_severity = min(dist_severity, 5)
+
+    # — تجميع سوقي —
+    acc_severity = 0
+    acc_warnings = []
+
+    if advancing_pct > 75:
+        acc_severity += 4
+        acc_warnings.append(f"أكثر من 75% من الأسهم صاعدة — تجميع سوقي قوي")
+    elif advancing_pct > 65:
+        acc_severity += 3
+        acc_warnings.append(f"أكثر من 65% من الأسهم صاعدة ({advancing_pct:.0f}%)")
+    elif advancing_pct > 55:
+        acc_severity += 2
+        acc_warnings.append(f"نسبة الأسهم الصاعدة مرتفعة ({advancing_pct:.0f}%)")
+    elif advancing_pct > 45:
+        acc_severity += 1
+
+    if above_open_pct > 50:
+        acc_severity += 2
+        acc_warnings.append(f"{above_open_pct:.0f}% من الأسهم فوق سعر الفتح")
+    elif above_open_pct > 35:
+        acc_severity += 1
+
+    if surge_green_pct > 15:
+        acc_severity += 2
+        acc_warnings.append(f"{surge_green_pct:.0f}% من الأسهم تصعد بحجم مرتفع")
+    elif surge_green_pct > 8:
+        acc_severity += 1
+
+    if near_high_pct > 25:
+        acc_severity += 2
+        acc_warnings.append(f"{near_high_pct:.0f}% من الأسهم قرب أعلى اليوم")
+    elif near_high_pct > 15:
+        acc_severity += 1
+
+    accumulation = acc_severity >= 3 and acc_severity > dist_severity
+    acc_severity = min(acc_severity, 5)
+
+    # تحديد الحالة النهائية
+    if accumulation:
+        state = "تجميع"
+        severity = acc_severity
+        warnings = acc_warnings
+    elif distribution:
+        state = "صرف"
+        severity = dist_severity
+        warnings = dist_warnings
+    else:
+        state = "عادي"
+        severity = 0
+        warnings = []
+
+    names = {0: "عادي", 1: "خفيف", 2: "متوسط", 3: "قوي", 4: "قوي جداً", 5: "شديد"}
+    return {
+        "state": state,
+        "distribution": distribution,
+        "accumulation": accumulation,
+        "severity": severity,
+        "level": names.get(severity, "غير معروف"),
+        "advancing_pct": round(advancing_pct, 1),
+        "declining_pct": round(declining_pct, 1),
+        "below_open_pct": round(below_open_pct, 1),
+        "above_open_pct": round(above_open_pct, 1),
+        "volume_surge_red_pct": round(surge_red_pct, 1),
+        "volume_surge_green_pct": round(surge_green_pct, 1),
+        "near_day_low_pct": round(near_low_pct, 1),
+        "near_day_high_pct": round(near_high_pct, 1),
+        "warnings": warnings,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

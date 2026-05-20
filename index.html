@@ -1591,6 +1591,7 @@ th.sort-desc::after { content: " ↓"; color: var(--accent-blue); }
 
     <!-- ── Opportunities ── -->
     <div id="view-opportunities" class="view">
+      <div id="marketDistBanner" style="display:none"></div>
       <div class="stat-row" id="oppStats"></div>
       <!-- فلترة برأس المال -->
       <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;
@@ -2095,6 +2096,7 @@ th.sort-desc::after { content: " ↓"; color: var(--accent-blue); }
 // ══════════════════════════════════════════════════════
 let ALL_DATA     = {};
 let TOP_DATA     = [];
+let _marketDistribution = {distribution: false, severity: 0};
 let FILTERED     = [];
 let currentTab   = 'overview';
 let overPage     = 1;
@@ -2675,7 +2677,10 @@ async function loadTop() {
   try {
     const r = await fetchWithTimeout('/api/top', 15000);
     const j = await r.json();
-    if (j.ok) TOP_DATA = j.top || [];
+    if (j.ok) {
+      TOP_DATA = j.top || [];
+      _marketDistribution = j.market_distribution || {distribution: false, severity: 0};
+    }
   } catch(e) { TOP_DATA = []; }
 }
 
@@ -2915,6 +2920,56 @@ function renderOpportunities() {
     return true;
   });
 
+  // عرض تحذير/تنبيه حالة السوق
+  const dist = _marketDistribution || {};
+  const distBanner = document.getElementById('marketDistBanner');
+  if (distBanner) {
+    if (dist.accumulation && dist.severity >= 3) {
+      distBanner.innerHTML = `
+        <div style="background:#27ae60;color:#fff;padding:10px 16px;border-radius:8px;margin-bottom:12px;
+                    display:flex;align-items:center;gap:10px;font-size:14px;direction:rtl">
+          <span style="font-size:20px">✅</span>
+          <div style="flex:1">
+            <strong style="font-size:15px">تجميع سوقي — ${dist.level || 'قوي'}</strong>
+            <div style="font-size:13px;opacity:0.9;margin-top:2px">
+              ${(dist.warnings || []).join(' • ')}
+            </div>
+          </div>
+          <span style="font-size:13px;opacity:0.85">${dist.advancing_pct || 0}% صاعدة</span>
+        </div>`;
+      distBanner.style.display = '';
+    } else if (dist.distribution) {
+      const severity = dist.severity || 0;
+      const colors = ['', '', 'var(--accent-yellow)', '#ff6b35', '#e74c3c', '#c0392b'];
+      const icons = ['', '', '⚠️', '⚠️', '🚫', '🚫'];
+      const sevLabels = ['', 'خفيف', 'متوسط', 'مرتفع', 'شديد', 'شديد جداً'];
+      distBanner.innerHTML = `
+        <div style="background:${colors[severity] || '#e74c3c'};color:#fff;padding:10px 16px;border-radius:8px;margin-bottom:12px;
+                    display:flex;align-items:center;gap:10px;font-size:14px;direction:rtl">
+          <span style="font-size:20px">${icons[severity] || '⚠️'}</span>
+          <div style="flex:1">
+            <strong style="font-size:15px">صرف جماعي — ${sevLabels[severity] || 'مرتفع'}</strong>
+            <div style="font-size:13px;opacity:0.9;margin-top:2px">
+              ${(dist.warnings || []).join(' • ')}
+            </div>
+          </div>
+          <span style="font-size:13px;opacity:0.85">${dist.advancing_pct || 0}% صاعدة</span>
+        </div>`;
+      distBanner.style.display = '';
+    } else if (dist.severity > 0) {
+      // عرض تحذير بسيط لو الخفيف
+      distBanner.innerHTML = `
+        <div style="background:var(--accent-yellow);color:#000;padding:6px 12px;border-radius:6px;margin-bottom:10px;
+                    display:flex;align-items:center;gap:8px;font-size:13px;direction:rtl;opacity:0.8">
+          <span>⚠️</span>
+          <span>حذر: ${dist.advancing_pct || 0}% فقط من الأسهم صاعدة</span>
+        </div>`;
+      distBanner.style.display = '';
+    } else {
+      distBanner.style.display = 'none';
+    }
+  }
+
   // عدد الأسهم الممكن شراؤها بالرأس المال
   if (capital) {
     FILTERED.forEach(t => {
@@ -2950,11 +3005,16 @@ function renderOpportunities() {
     const tq   = t.trade_quality || 0;
     const prox = t.proximity || 0;
     const liq  = t.liq_score || 0;
+    const md = t.market_distribution || {};
 
     // ready badge
     let readyBadge;
     const scenario = t.entry_scenario || 'WAIT';
-    if (scenario === 'MARKET' || t.ready) {
+    if (md && md.accumulation && md.severity >= 3) {
+      readyBadge = `<span class="ready-badge" style="background:#27ae60;color:#fff">✅ تجميع سوقي — فرصة مواتية</span>`;
+    } else if (md && md.distribution && md.severity >= 4) {
+      readyBadge = `<span class="ready-badge" style="background:#c0392b;color:#fff">🚫 صرف جماعي — تجنب الدخول</span>`;
+    } else if (scenario === 'MARKET' || t.ready) {
       readyBadge = `<span class="ready-badge ready">✅ ادخل الآن بسعر السوق</span>`;
     } else if (scenario === 'NEAR' || prox >= 70) {
       const distPct = t.entry ? ((t.price - t.entry)/t.price*100).toFixed(1) : prox.toFixed(0);

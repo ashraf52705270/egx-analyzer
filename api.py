@@ -656,12 +656,19 @@ async def get_top_opportunities(user: Dict = Depends(require_premium)):
     near_count = sum(1 for s in scored if not s["ready"] and s["proximity"] >= 70)
     strong_count = sum(1 for s in scored if s["signal_type"] == "BUY_STRONG")
 
+    # إضافة حالة الصرف الجماعي من محرك القرار
+    engine = get_engine()
+    market_dist = engine.market_distribution if engine else {"distribution": False, "severity": 0}
+    for t in scored[:60]:
+        t["market_distribution"] = market_dist
+
     return {
         "ok": True,
         "count": len(scored),
         "ready_count": ready_count,
         "near_count": near_count,
         "strong_count": strong_count,
+        "market_distribution": market_dist,
         "top": scored[:60],
     }
 
