@@ -35,6 +35,7 @@ DEFAULT_MIN_REL_VOL = 0.5
 DEFAULT_MAX_CONSECUTIVE_LOSSES = 3
 DEFAULT_MAX_RISK_PCT_PER_TRADE = 8.0
 DEFAULT_DAILY_LOSS_LIMIT = 5.0
+DEFAULT_COMMISSION_PCT = 0.6  # % جولة كاملة (شراء + بيع)
 
 MARKET_OPEN_HOUR = 10
 MARKET_OPEN_MINUTE = 0
@@ -53,6 +54,14 @@ RISK_DISCLAIMER = """
 TRADE_MODE_AUTO = "auto"
 from database import *
 from analysis import *
+
+
+def _calc_commission(entry: float, exit_: float, shares: int, settings: dict) -> float:
+    """حساب مصاريف التداول للجولة كاملة (شراء + بيع)"""
+    pct = float(settings.get("commission_pct", DEFAULT_COMMISSION_PCT))
+    return round((entry + exit_) * shares * pct / 200, 2)
+
+
 class DecisionEngine:
     """
     محرك القرار التلقائي — يعمل في خيط خلفي كل 30 ثانية
@@ -345,6 +354,9 @@ class DecisionEngine:
         # منع فتح صفقات أثناء الصرف الشديد (بعد العتبات المعدلة)
         block_new = dist["distribution"] and dist["severity"] >= 4
 
+        # كشف نظام السوق لحساب ml_confidence بشكل متسق مع api/top
+        market_regime = detect_market_regime(stocks)
+
         changed = False
         opened_this_cycle: set = set()
         trade_seq = 0
@@ -362,6 +374,19 @@ class DecisionEngine:
                 if not a:
                     continue
                 v["analysis"] = a
+            # إعادة حساب ml_confidence مع نظام السوق (نفس منطق _get_stocks_with_analysis)
+            if a:
+                tf = a.get("timeframe_alignment")
+                harm = a.get("harmonic_pattern")
+                ml = calculate_ml_confidence(v, a, regime=market_regime, tf=tf, harmonic=harm)
+                kelly = calculate_kelly_size(
+                    ml["ml_score"],
+                    a.get("trade", {}).get("rr1", 1.0),
+                    a.get("trade", {}).get("risk_pct", 2.0),
+                    settings.get("capital", DEFAULT_CAPITAL),
+                )
+                a["ml_confidence"] = ml
+                a["kelly"] = kelly
             t     = a.get("trade", {})
             price = v.get("price", 0)
             if not price:
@@ -389,6 +414,13 @@ class DecisionEngine:
             # قرار 1: هل نفتح صفقة جديدة؟
             # ════════════════════════════════════════════════════════
 
+            # ════════════════════════════════════════════════════════
+            # التحليلات المتقدمة
+            # ════════════════════════════════════════════════════════
+            ml_score = a.get("ml_confidence", {}).get("ml_score", 50)
+            tf_align = a.get("timeframe_alignment", {}).get("alignment_score", 0)
+            harmonic_conf = (a.get("harmonic_pattern") or {}).get("confidence", 0) or 0
+
             # تسجيل سبب رفض السهم (عشان التشخيص)
             if sig_type in BUY_SIGNALS and sym not in open_trades:
                 reason = None
@@ -398,9 +430,12 @@ class DecisionEngine:
                 elif liq < min_liq: reason = f"liq ({liq}) < min ({min_liq})"
                 elif bull_c < min_confirm: reason = f"bull_count ({bull_c}) < min ({min_confirm})"
                 elif scen not in ENTRY_SCENARIOS_ALLOWED: reason = f"scenario ({scen}) غير مسموح"
+                elif not t.get("ready", False): reason = f"السعر خارج نطاق الدخول"
                 elif adx_val < min_adx: reason = f"ADX ({adx_val:.1f}) < {min_adx}"
                 elif rel_vol < min_rel_vol: reason = f"rel_vol ({rel_vol:.1f}) < {min_rel_vol}"
                 elif not price_above_sma50: reason = f"price ({price_ma}) <= SMA50 ({sma50_val})"
+                elif ml_score < 35: reason = f"ML ({ml_score}) < 35"
+                elif tf_align < -0.6: reason = f"توافق إطارات ({tf_align}) ← عكس الترند"
                 elif was_sent(sym, "OPEN"): reason = "تم إرسال إشارة OPEN من قبل"
                 if reason:
                     logger.info("  [رفض] %s ← %s", sym, reason)
@@ -426,6 +461,9 @@ class DecisionEngine:
                 and liq >= min_liq
                 and bull_c >= min_confirm
                 and scen in ENTRY_SCENARIOS_ALLOWED
+                and t.get("ready", False)
+                and ml_score >= 35
+                and tf_align >= -0.6
                 and adx_val >= min_adx
                 and rel_vol >= min_rel_vol
                 and price_above_sma50
@@ -494,6 +532,9 @@ class DecisionEngine:
                         # غلق الصفقة
                         pnl_pct = round((price - ep) / ep * 100, 2) if ep else 0
                         pnl_egp = round((price - ep) * tr.get("shares", 0), 2) if ep else 0
+                        # خصم مصاريف التداول (افتراضي 0.6% جولة كاملة)
+                        comm = _calc_commission(ep, price, tr.get("shares", 0), settings)
+                        pnl_egp -= comm
                         self._daily_pnl += pnl_egp
                         # تتبع الخسائر المتتالية
                         if pnl_egp < 0:
@@ -510,6 +551,7 @@ class DecisionEngine:
                             update_signal_result(
                                 sig_id, "LOSS", pnl_egp, pnl_pct, price, "STOP",
                             )
+                            update_ml_weights("LOSS", {"sym": sym})
                         tr.update({
                             "status": "closed",
                             "exit_price": price,
@@ -753,7 +795,7 @@ class DecisionEngine:
         cap      = settings.get("capital", DEFAULT_CAPITAL)
         risk_pct = settings.get("risk_pct", DEFAULT_RISK_PCT)
 
-        entry_p = t.get("entry_ideal", price)
+        entry_p = price  # سعر السوق الفعلي، مش entry_ideal
         near_t  = t.get("near_targets", [])
         near_p  = t.get("near_pcts", [])
         far_t   = t.get("targets", [])
@@ -931,6 +973,9 @@ class DecisionEngine:
             if total_open == 0:
                 pnl_pct = round((price - entry_price) / entry_price * 100, 2) if entry_price else 0
                 pnl_egp = round((price - entry_price) * tr.get("q_f2_qty", 0), 2) if entry_price else 0
+                # خصم مصاريف التداول (افتراضي 0.6% جولة كاملة)
+                comm = _calc_commission(entry_price, price, tr.get("q_f2_qty", 0), settings)
+                pnl_egp -= comm
                 self._daily_pnl += pnl_egp
                 self._consecutive_losses = 0
                 sig_id = tr.get("signal_log_id")
@@ -939,6 +984,7 @@ class DecisionEngine:
                         sig_id, "WIN",
                         pnl_egp, pnl_pct, price, "TARGETS",
                     )
+                    update_ml_weights("WIN", {"sym": sym})
                 tr.update({
                     "status": "closed",
                     "exit_price": price,
@@ -1014,6 +1060,8 @@ class DecisionEngine:
 
             pnl_pct = round((price - ep) / ep * 100, 2) if ep else 0
             pnl_egp = round((price - ep) * tr.get("shares", 0), 2) if ep else 0
+            comm = _calc_commission(ep, price, tr.get("shares", 0), load_settings())
+            pnl_egp -= comm
             self._daily_pnl += pnl_egp
             tr.update({
                 "status": "closed",
@@ -1172,28 +1220,30 @@ def detect_market_distribution(stocks: Dict[str, Any]) -> Dict[str, Any]:
     near_day_high = 0
 
     for sym, v in stocks.items():
-        price = v.get("price", 0)
-        chg = v.get("change_pct", 0) or 0
+        # v is StockData object, convert to dict lookup
+        vd = v if isinstance(v, dict) else vars(v)
+        price = vd.get("price", 0)
+        chg = vd.get("change_pct", 0) or 0
 
         if chg > 0:
             advancing += 1
         elif chg < 0:
             declining += 1
 
-        chg_from_open = v.get("chg_from_open", 0) or 0
+        chg_from_open = vd.get("chg_from_open", 0) or 0
         if chg_from_open < -1:
             below_open += 1
         elif chg_from_open > 1:
             above_open += 1
 
-        rel_vol = (v.get("volume", 0) / v.get("avg_vol", 1)) if (v.get("avg_vol") or 0) > 0 else 0
+        rel_vol = (vd.get("volume", 0) / vd.get("avg_vol", 1)) if (vd.get("avg_vol") or 0) > 0 else 0
         if rel_vol > 1.5 and chg < -1:
             volume_surge_red += 1
         elif rel_vol > 1.5 and chg > 1:
             volume_surge_green += 1
 
-        day_high = v.get("day_high", 0)
-        day_low = v.get("day_low", 0)
+        day_high = vd.get("day_high", 0)
+        day_low = vd.get("day_low", 0)
         if day_high and day_low and price and (day_high - day_low) > 0:
             pos_in_range = (price - day_low) / (day_high - day_low)
             if pos_in_range < 0.3 and chg < 0:

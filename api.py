@@ -1,5 +1,5 @@
 import sys, os, json, logging, time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal
 from pathlib import Path
@@ -125,6 +125,7 @@ class SettingsUpdate(BaseModel):
     auto_close: Optional[bool] = None
     test_mode: Optional[bool] = None
     trade_mode: Optional[str] = None
+    commission_pct: Optional[float] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
     ad_image_url: Optional[str] = None
@@ -289,6 +290,26 @@ def _get_stocks_with_analysis() -> Dict[str, Any]:
             v["analysis"] = analyze_stock(sym, v)
         result[sym] = v
 
+    # حساب نظام السوق من كل الأسهم
+    regime = detect_market_regime(stocks)
+
+    # إعادة حساب ML confidence مع نظام السوق والتوقعات متعددة الإطارات
+    for sym, v in result.items():
+        a = v.get("analysis")
+        if a and v.get("price"):
+            tf = a.get("timeframe_alignment")
+            harm = a.get("harmonic_pattern")
+            ml = calculate_ml_confidence(v, a, regime=regime, tf=tf, harmonic=harm)
+            kelly = calculate_kelly_size(
+                ml["ml_score"],
+                a.get("trade", {}).get("rr1", 1.0),
+                a.get("trade", {}).get("risk_pct", 2.0),
+                load_settings().get("capital", DEFAULT_CAPITAL),
+            )
+            a["ml_confidence"] = ml
+            a["kelly"] = kelly
+            a["market_regime"] = regime
+
     global _last_fetch_time
     _last_fetch_time = time.time()
 
@@ -379,7 +400,10 @@ def _analyze_performance() -> Dict[str, Any]:
 async def serve_frontend():
     """تقديم واجهة المستخدم HTML (من ملف index.html مع fallback)"""
     html = _get_html_frontend()
-    return HTMLResponse(content=html, status_code=200)
+    from fastapi.responses import Response
+    return Response(content=html, status_code=200, media_type="text/html",
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+                             "Pragma": "no-cache", "Expires": "0"})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -588,16 +612,27 @@ async def get_top_opportunities(user: Dict = Depends(require_premium)):
         if rr1 < 1.5 or liq < 20:
             continue
 
+        # التحليلات المتقدمة — لازم تجتاز عشان تدخل القائمة
+        ml_s = a.get("ml_confidence", {}).get("ml_score", 50)
+        harm_c = (a.get("harmonic_pattern") or {}).get("confidence", 0) or 0
+        tf_s = a.get("timeframe_alignment", {}).get("alignment_score", 0)
+        if ml_s < 35:
+            continue
+        if tf_s < -0.6:
+            continue
+
         # السهم اللي يستوفي كل شروط الطيار الآلي يأخذ +50 نقطة إضافية
         engine_ready = (
             tq >= min_q and
             rr1 >= min_r and
             liq >= min_l and
             bull_c >= min_c and
-            scenario in ("MARKET", "NEAR") and
+            scenario == "MARKET" and
             adx_v >= min_adx_top and
             rel_v >= min_rv_top and
-            price_above_sma50_top
+            price_above_sma50_top and
+            ml_s >= 35 and
+            tf_s >= -0.6
         )
         engine_bonus = 50 if engine_ready else 0
 
@@ -649,6 +684,14 @@ async def get_top_opportunities(user: Dict = Depends(require_premium)):
             "resistance_info": a.get("resistance_info"),
             "position_data": a.get("position_data"),
             "entry_time_hint": a.get("entry_time_hint"),
+            "atr": v.get("atr"),
+            "sma50": v.get("sma50"),
+            "sma200": v.get("sma200"),
+            # التحليلات المتقدمة
+            "ml_confidence": a.get("ml_confidence"),
+            "timeframe_alignment": a.get("timeframe_alignment"),
+            "harmonic_pattern": a.get("harmonic_pattern"),
+            "kelly": a.get("kelly"),
         })
 
     scored.sort(key=lambda x: x["sort_score"], reverse=True)
@@ -662,6 +705,22 @@ async def get_top_opportunities(user: Dict = Depends(require_premium)):
     for t in scored[:60]:
         t["market_distribution"] = market_dist
 
+    # استخراج نظام السوق من أول سهم (جميعهم نفس القيمة)
+    regime = None
+    for s in scored:
+        if s.get("ml_confidence") and s["ml_confidence"].get("ml_score"):
+            regime = s["ml_confidence"].get("market_regime") or a.get("market_regime")
+            break
+
+    regime_data = scored[0].get("ml_confidence", {}).get("market_regime") if scored else None
+    if not regime_data:
+        # احسبها من _get_stocks_with_analysis
+        try:
+            dm = get_data_manager()
+            regime_data = detect_market_regime(dm.get_stocks())
+        except Exception:
+            regime_data = {"regime": "—", "regime_en": "UNKNOWN", "avg_adx": 0, "volatility": "—"}
+
     return {
         "ok": True,
         "count": len(scored),
@@ -669,6 +728,7 @@ async def get_top_opportunities(user: Dict = Depends(require_premium)):
         "near_count": near_count,
         "strong_count": strong_count,
         "market_distribution": market_dist,
+        "market_regime": regime_data,
         "top": scored[:60],
     }
 
@@ -879,6 +939,8 @@ async def get_trades():
     trades = load_trades()
     dm = get_data_manager()
     stocks = dm.get_stocks() if dm.cached_stock_count > 0 else {}
+    _comm_settings = load_settings()
+    _comm_pct = float(_comm_settings.get("commission_pct", 0.6))
 
     for tr in trades:
         if tr.get("status") == "active":
@@ -893,9 +955,9 @@ async def get_trades():
             tr["current_pnl_pct"] = round(
                 (cur - tr["entry_price"]) / tr["entry_price"] * 100, 2
             )
-            tr["current_pnl_egp"] = round(
-                (cur - tr["entry_price"]) * tr.get("shares", 0), 2
-            )
+            raw_pnl = (cur - tr["entry_price"]) * tr.get("shares", 0)
+            buy_comm = round(tr["entry_price"] * tr.get("shares", 0) * _comm_pct / 200, 2)
+            tr["current_pnl_egp"] = round(raw_pnl - buy_comm, 2)
 
     return {"ok": True, "trades": trades, "count": len(trades)}
 
@@ -1222,6 +1284,253 @@ async def get_backtest_trade(signal_log_id: int, user: Dict = Depends(require_pr
 # ═══════════════════════════════════════════════════════════════
 
 
+# ═══════════════════════════════════════════════════════════════
+# 22b. Time Reversal Prediction
+# ═══════════════════════════════════════════════════════════════
+
+def predict_time_reversal(adv_ratio: float, avg_rsi: float,
+                          buy_signals: int, sell_signals: int,
+                          above_sma50_pct: float) -> dict:
+    """
+    توقع احتمالية انعكاس السوق وتوقيته خلال الجلسة والأيام القادمة
+    يستخدم: Gann time cycles, Fibonacci time zones, Z-score breadth,
+    تشبع RSI، ونسبة الأسهم فوق المتوسط
+    """
+    now = cairo_now()
+    h, m = now.hour, now.minute
+    mins = h * 60 + m
+    SESSION_START = 600   # 10:00
+    SESSION_END = 870     # 14:30
+    SESSION_LEN = 270
+
+    # ── Intraday Gann 8-division time zones ──
+    gann_octaves = []
+    for i in range(1, 9):
+        t = SESSION_START + (SESSION_LEN * i // 8)
+        th, tm = divmod(t, 60)
+        gann_octaves.append(f"{th:02d}:{tm:02d}")
+
+    # Gann key reversal zones (3/8, 4/8, 5/8 = mid-session, 7/8)
+    gann_key = {
+        "3_8": f"{gann_octaves[2]}–{gann_octaves[3]}",
+        "4_8": gann_octaves[3],
+        "5_8": gann_octaves[4],
+        "7_8": f"{gann_octaves[6]}–{gann_octaves[7]}",
+    }
+
+    # Fibonacci time retracement from session start
+    fib_ratios = [0.236, 0.382, 0.500, 0.618, 0.786]
+    fib_times = {}
+    for r in fib_ratios:
+        t = SESSION_START + int(SESSION_LEN * r)
+        th, tm = divmod(t, 60)
+        fib_times[str(r)] = f"{th:02d}:{tm:02d}"
+
+    # أقرب نافذة زمنية حالية
+    current_gann_window = None
+    prev_mark = SESSION_START
+    for i, g in enumerate(gann_octaves):
+        gm = int(g.split(":")[0]) * 60 + int(g.split(":")[1])
+        if prev_mark <= mins < gm:
+            label = f"الثُمن {i}/{8}"
+            if i in (2, 3, 4, 7):
+                label += " (نافذة انعكاس)"
+            current_gann_window = f"{label}: {format_time(prev_mark)}–{g}"
+            break
+        prev_mark = gm
+
+    # ── Z-score breadth deviation ──
+    # افترض أن متوسط adv_ratio التاريخي ≈ 55% (سوق متوازن)
+    HIST_MEAN_ADV = 55.0
+    HIST_STD_ADV = 10.0
+    z_breadth = (adv_ratio - HIST_MEAN_ADV) / HIST_STD_ADV
+
+    # ── Mean reversion score ──
+    # RSI تشبع
+    rsi_factor = 0
+    if avg_rsi is not None:
+        if avg_rsi < 35:
+            rsi_factor = 2      # oversold → bounce likely
+        elif avg_rsi < 40:
+            rsi_factor = 1
+        elif avg_rsi > 65:
+            rsi_factor = -2     # overbought → drop likely
+        elif avg_rsi > 60:
+            rsi_factor = -1
+
+    # Breadth divergence score
+    # z_breadth سالب = هبوط قوي → احتمال ارتداد
+    breadth_factor = 0
+    if z_breadth < -1.5:
+        breadth_factor = 2
+    elif z_breadth < -1.0:
+        breadth_factor = 1
+    elif z_breadth > 1.5:
+        breadth_factor = -2
+    elif z_breadth > 1.0:
+        breadth_factor = -1
+
+    # Signal ratio
+    total_signals = buy_signals + sell_signals or 1
+    signal_ratio = buy_signals / total_signals * 100
+    signal_factor = 0
+    if signal_ratio < 25:
+        signal_factor = 2       # very few buys → potential bottom
+    elif signal_ratio < 35:
+        signal_factor = 1
+    elif signal_ratio > 75:
+        signal_factor = -2      # too many buys → potential top
+    elif signal_ratio > 65:
+        signal_factor = -1
+
+    # ── Intraday prediction ──
+    intra_score = rsi_factor + breadth_factor + signal_factor
+
+    if intra_score >= 3:
+        intra_direction = "انعكاس صعودي مرجح"
+        intra_conf = min(80, 50 + abs(intra_score) * 8)
+    elif intra_score >= 1:
+        intra_direction = "ميل صعودي"
+        intra_conf = min(60, 40 + abs(intra_score) * 8)
+    elif intra_score <= -3:
+        intra_direction = "انعكاس هبوطي مرجح"
+        intra_conf = min(80, 50 + abs(intra_score) * 8)
+    elif intra_score <= -1:
+        intra_direction = "ميل هبوطي"
+        intra_conf = min(60, 40 + abs(intra_score) * 8)
+    else:
+        intra_direction = "استمرار جانبي / انتظار"
+        intra_conf = 40
+
+    now_key = ""
+    if mins < SESSION_START:
+        now_key = "السوق لم يفتح بعد"
+    elif mins > SESSION_END:
+        now_key = "السوق مغلق"
+    else:
+        now_key = f"النافذة الحالية: {current_gann_window}" if current_gann_window else ""
+
+    # Fibonacci time zone closest ahead
+    next_fib = None
+    for r in fib_ratios:
+        t_min = SESSION_START + int(SESSION_LEN * r)
+        if t_min > mins + 5:   # at least 5 min ahead
+            next_fib = fib_times[str(r)]
+            break
+
+    intraday = {
+        "direction": intra_direction,
+        "confidence_pct": intra_conf,
+        "current_window": now_key,
+        "next_fib_time": next_fib or "انتهت الجلسة",
+        "gann_key_zones": gann_key,
+        "fib_time_zones": fib_times,
+    }
+
+    # ── 3-day prediction ──
+    # Composite score للاتجاه العام
+    trend_score = rsi_factor * 0.4 + breadth_factor * 0.35 + signal_factor * 0.25
+
+    # Gann daily cycles: 7, 9, 13 trading days
+    # استخدم يوم الجلسة لتحديد موقعنا من الدورة
+    today = date.today()
+    # يوم تداول تقريبي (بعد الجلسة 5)
+    td = today.toordinal()
+    gann_7 = td % 7
+    gann_9 = td % 9
+    gann_13 = td % 13
+
+    # Gann cycle readiness (closer to cycle end = higher reversal probability)
+    gann_readiness = 0
+    if gann_7 >= 5:
+        gann_readiness += 1
+    if gann_9 >= 7:
+        gann_readiness += 1
+    if gann_13 >= 10:
+        gann_readiness += 1
+
+    daily_score = trend_score + gann_readiness * 0.3
+
+    # حدد اتجاها لكل يوم من الأيام الثلاثة القادمة
+    # مع تزايد عدم اليقين
+    def predict_day(day_offset: int, base_score: float) -> dict:
+        decay = 1.0 - (day_offset - 1) * 0.15
+        score = base_score * decay
+        # إضافة ضوضاء عشوائية بسيطة (لكن متسقة حسب اليوم)
+        det = hash((today.toordinal(), day_offset)) % 7 - 3
+        score += det * 0.05
+
+        if score >= 0.8:
+            d = "صعود قوي 📈"
+            c = min(85, 55 + score * 20)
+            k = 1
+        elif score >= 0.3:
+            d = "ميل صعودي ↑"
+            c = min(65, 45 + score * 20)
+            k = 1
+        elif score <= -0.8:
+            d = "هبوط قوي 📉"
+            c = min(85, 55 + abs(score) * 20)
+            k = -1
+        elif score <= -0.3:
+            d = "ميل هبوطي ↓"
+            c = min(65, 45 + abs(score) * 20)
+            k = -1
+        else:
+            d = "جانبي ↔"
+            c = 45
+            k = 0
+
+        # مستويات الدعم والمقاومة المتوقعة
+        base = 100
+        if k == 1:
+            support = f"-{0.5 + day_offset * 0.3:.1f}%"
+            resist = f"+{1.0 + day_offset * 0.5:.1f}%"
+        elif k == -1:
+            support = f"-{1.0 + day_offset * 0.5:.1f}%"
+            resist = f"+{0.5 + day_offset * 0.3:.1f}%"
+        else:
+            support = f"-{0.8 + day_offset * 0.3:.1f}%"
+            resist = f"+{0.8 + day_offset * 0.3:.1f}%"
+
+        return {
+            "direction": d,
+            "confidence_pct": int(c),
+            "expected_range": f"{support} / {resist}",
+        }
+
+    days = {}
+    next_dates = []
+    d = today
+    added = 0
+    while added < 3:
+        d += timedelta(days=1)
+        if d.weekday() < 5:  # skip weekends
+            next_dates.append(d)
+            added += 1
+
+    for i, nd in enumerate(next_dates):
+        weekday_ar = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
+        label = f"{weekday_ar[nd.weekday()]} {nd.strftime('%d/%m')}"
+        days[f"day_{i+1}"] = predict_day(i + 1, daily_score)
+
+    three_day = {
+        "days": days,
+        "overall_trend": days["day_1"]["direction"] if days else "—",
+        "gann_cycle_readiness": f"{gann_readiness}/3",
+    }
+
+    return {
+        "intraday": intraday,
+        "three_day": three_day,
+    }
+
+
+def format_time(mins: int) -> str:
+    h, m = divmod(mins, 60)
+    return f"{h:02d}:{m:02d}"
+
+
 @router.get("/api/breadth")
 async def get_breadth():
     """تحليل اتساع السوق — الأسهم الصاعدة/الهابطة + متوسط RSI"""
@@ -1329,6 +1638,8 @@ async def get_breadth():
         if v["count"] > 0
     }
 
+    tp = predict_time_reversal(adv_ratio, avg_rsi, buy_signals, sell_signals,
+                               above_sma50 / total * 100 if total else 50)
     return {
         "ok": True,
         "total": total,
@@ -1344,6 +1655,7 @@ async def get_breadth():
         "market_mood": mkt_mood,
         "warning": breadth_warning,
         "entry_time": calc_optimal_entry_time(),
+        "time_prediction": tp,
         # بيانات إضافية من النسخة الأصلية
         "market_status": mstatus,
         "market_code": mcode,
@@ -1912,6 +2224,12 @@ async def delete_admin_user(body: dict, user: Dict = Depends(get_current_user)):
         session.delete(target)
         session.commit()
     return {"ok": True, "detail": "تم حذف المستخدم بنجاح"}
+
+
+@router.get("/api/ping")
+async def ping():
+    """نبض حياة — يحافظ على حالة \"متصل الآن\" للتطبيق أحادي الصفحة (SPA)"""
+    return {"ok": True, "pong": True}
 
 
 @router.get("/api/analytics")

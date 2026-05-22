@@ -2447,6 +2447,8 @@ def calc_entry_targets(
     volume: Optional[float] = None,
     avg_vol: Optional[float] = None,
     market_cap: Optional[float] = None,
+    sma50: Optional[float] = None,
+    sma200: Optional[float] = None,
 ) -> TradeDict:
     """
     حساب أهداف الدخول والخروج مع سيناريوهات مختلفة
@@ -2464,6 +2466,10 @@ def calc_entry_targets(
     if signal_type in ("BUY_STRONG", "BUY", "ACCUMULATE"):
         # ── الدعم الأقرب تحت السعر ──
         support_candidates = [fib.get("F236", 0), pivots.get("S1", 0)]
+        if sma50 and 0 < sma50 < price:
+            support_candidates.append(sma50)
+        if sma200 and 0 < sma200 < price:
+            support_candidates.append(sma200)
         valid_supports = [c for c in support_candidates if 0 < c < price]
         nearest_support = round(max(valid_supports), 3) if valid_supports \
                           else round(price * 0.97, 3)
@@ -2472,11 +2478,20 @@ def calc_entry_targets(
         # حساب المسافة بين السعر وأقرب دعم كنسبة
         dist_to_support = (price - nearest_support) / price * 100 if price > 0 else 10
 
-        if dist_to_support <= 1.5:
+        # عتبات ديناميكية حسب ATR (لو متاح)، وإلا الأرقام الثابتة
+        atr_pct = (atr / price * 100) if (atr and price) else 0
+        if atr_pct > 0:
+            market_thresh = max(1.0, atr_pct * 0.8)
+            near_thresh   = max(2.5, atr_pct * 2.0)
+        else:
+            market_thresh = 1.5
+            near_thresh   = 4.0
+
+        if dist_to_support <= market_thresh:
             # السعر على الدعم مباشرة — ادخل بسعر السوق
             entry_ideal      = round(price * 1.001, 3)
             entry_scenario   = "MARKET"
-        elif dist_to_support <= 4.0:
+        elif dist_to_support <= near_thresh:
             # السعر قريب من الدعم
             entry_ideal      = round(nearest_support * 1.005, 3)
             # ضمان: entry_ideal لا يتجاوز السعر الحالي
@@ -2488,26 +2503,62 @@ def calc_entry_targets(
             entry_ideal      = round(nearest_support, 3)
             entry_scenario   = "WAIT"
 
-        # ── وقف الخسارة (محسوب من entry_ideal الجديد) ──
-        sl_base   = min(fib.get("F618", price * 0.9), pivots.get("S2", price * 0.9))
-        stop_loss = round(sl_base * 0.99 * liq_sl_mult, 3)
+        # ── وقف الخسارة (محسوب من entry_ideal مباشرة) ──
         if atr:
-            stop_loss = max(stop_loss, round(entry_ideal - 3.0 * atr, 3))
-        stop_loss = min(stop_loss, round(entry_ideal * 0.98, 3))
+            sl_atr = round(entry_ideal - 2.5 * atr, 3)
+        else:
+            sl_atr = round(entry_ideal * 0.97, 3)
+        sl_candidates = []
+        f618 = fib.get("F618", 0)
+        s2   = pivots.get("S2", 0)
+        if f618 and 0 < f618 < entry_ideal:
+            sl_candidates.append(f618 * 0.99)
+        if s2 and 0 < s2 < entry_ideal:
+            sl_candidates.append(s2 * 0.99)
+        sl_structure = round(max(sl_candidates) * liq_sl_mult, 3) if sl_candidates \
+                       else round(entry_ideal * 0.97, 3)
+        stop_loss = max(sl_atr, sl_structure)
+        stop_loss = min(stop_loss, round(entry_ideal * 0.985, 3))
 
-        targets = [
+        # ── الأهداف الأساسية (فلترة فوق entry_ideal) ──
+        raw_targets = [
             round(max(fib.get("R1", 0), pivots.get("R1", 0)), 3),
             round(max(fib.get("R2", 0), pivots.get("R2", 0)), 3),
             round(max(fib.get("R3", 0), pivots.get("R3", 0)), 3),
         ]
+        targets = [t for t in raw_targets if t > entry_ideal * 1.005]
+        if len(targets) < 3:
+            fallback = [round(entry_ideal * r, 3) for r in [1.03, 1.06, 1.10]]
+            existing = set(targets)
+            for fb in fallback:
+                if fb not in existing:
+                    targets.append(fb)
+                if len(targets) == 3:
+                    break
+        targets = sorted(targets)[:3]
+
+        # ── الأهداف القريبة (مع تحقق R:R) ──
         if atr and entry_ideal > 0:
-            near_targets = [
+            near_targets_raw = [
                 round(entry_ideal + 1.0 * atr, 3),
                 round(entry_ideal + 1.5 * atr, 3),
                 round(entry_ideal + 2.5 * atr, 3),
             ]
         else:
-            near_targets = [round(entry_ideal * r, 3) for r in [1.02, 1.035, 1.055]]
+            near_targets_raw = [round(entry_ideal * r, 3) for r in [1.02, 1.035, 1.055]]
+        risk_pts = abs(entry_ideal - stop_loss)
+        if risk_pts > 0:
+            near_targets = [
+                t for t in near_targets_raw
+                if (t - entry_ideal) / risk_pts >= 1.0
+            ]
+            if not near_targets:
+                near_targets = [
+                    round(entry_ideal + risk_pts, 3),
+                    round(entry_ideal + risk_pts * 1.5, 3),
+                    round(entry_ideal + risk_pts * 2.5, 3)]
+        else:
+            near_targets = near_targets_raw
 
         # ── entry_range_high من R:R = 1.5 ──
         MIN_RR = 1.5
@@ -2516,11 +2567,19 @@ def calc_entry_targets(
         entry_range_high = round(rr_max, 3)
         if entry_range_high <= entry_ideal:
             entry_range_high = round(entry_ideal * 1.015, 3)
+        if entry_range_high >= t1:
+            entry_range_high = round(t1 * 0.99, 3)
 
-        # ── entry_range_low: الدعم الأقوى التالي ──
-        rl_raw = max(fib.get("F382", 0), pivots.get("S2", 0))
-        entry_range_low = round(rl_raw, 3)
-        if entry_range_low >= entry_ideal:
+        # ── entry_range_low: الدعم الأقوى تحت entry_ideal ──
+        rl_candidates = [
+            fib.get("F382", 0),
+            fib.get("F500", 0),
+            pivots.get("S2", 0),
+        ]
+        valid_rl = [c for c in rl_candidates if 0 < c < entry_ideal]
+        if valid_rl:
+            entry_range_low = round(max(valid_rl), 3)
+        else:
             entry_range_low = round(entry_ideal * 0.97, 3)
 
     elif signal_type in ("SELL_STRONG", "SELL"):
@@ -2595,6 +2654,27 @@ def calc_entry_targets(
     elif trade_quality >= 40: quality_label = "فرصة مقبولة ⭐"
     elif trade_quality >= 20: quality_label = "انتظر تحسن الشروط ⏳"
     else:                     quality_label = "لا تناسب الآن 🚫"
+
+    # ══ Sanity Check: تأكد من تناسق القيم النهائية ══
+    assert_errors = []
+    if stop_loss >= entry_ideal:
+        assert_errors.append("SL >= entry_ideal")
+        stop_loss = round(entry_ideal * 0.97, 3)
+    if entry_range_low >= entry_ideal:
+        assert_errors.append("range_low >= entry_ideal")
+        entry_range_low = round(entry_ideal * 0.97, 3)
+    if entry_range_high <= entry_ideal:
+        assert_errors.append("range_high <= entry_ideal")
+        entry_range_high = round(entry_ideal * 1.015, 3)
+    if targets and targets[0] <= entry_ideal:
+        assert_errors.append("T1 <= entry_ideal")
+        targets = [round(entry_ideal * r, 3) for r in [1.03, 1.06, 1.10]]
+    if assert_errors:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"calc_entry_targets sanity check failed: {assert_errors} "
+            f"| price={price} entry={entry_ideal} sl={stop_loss}"
+        )
 
     return {
         "entry_ideal":      entry_ideal,
@@ -3091,7 +3171,8 @@ def analyze_stock(sym: str, d: Dict[str, Any]) -> Optional[AnalysisResult]:
     trade = calc_entry_targets(
         price, fib, pivots, sig_type, atr,
         volume=volume, avg_vol=avg_vol,
-        market_cap=d.get("market_cap"))
+        market_cap=d.get("market_cap"),
+        sma50=sma50, sma200=sma200)
 
     # حجم
     rel_v = (volume / avg_vol) if avg_vol and avg_vol > 0 else 1.0
@@ -3145,7 +3226,77 @@ def analyze_stock(sym: str, d: Dict[str, Any]) -> Optional[AnalysisResult]:
     # إضافة نقاط Divergence والتأكيد للـ score
     div_bonus  = sum(d["signal"] for d in divergences) if divergences else 0
     conf_bonus = confirmation["score_bonus"]
-    score_adj  = max(0, min(100, score + div_bonus + conf_bonus))
+
+    # ════════════════════════════════════════════════════════
+    # أ. Confluence Score — وزن مستويات التقاطع على الإشارة
+    # ════════════════════════════════════════════════════════
+    confluence_bonus = 0
+    confluence_list  = multi_fib.get("confluence", [])
+    if confluence_list and price > 0:
+        below = [c for c in confluence_list if c["val"] < price and c["val"] > price * 0.85]
+        if below:
+            best_conf = min(below, key=lambda c: price - c["val"])
+            dist_pct  = (price - best_conf["val"]) / price * 100
+            strength  = best_conf["strength"]
+            if dist_pct < 1.0 and strength >= 3:
+                confluence_bonus = 12
+            elif dist_pct < 1.0 and strength >= 2:
+                confluence_bonus = 8
+            elif dist_pct < 2.0 and strength >= 2:
+                confluence_bonus = 5
+            elif dist_pct < 3.0 and strength >= 2:
+                confluence_bonus = 3
+
+    # ════════════════════════════════════════════════════════
+    # ب. قوة الحجم عند مستوى الدخول تحديداً
+    # ════════════════════════════════════════════════════════
+    volume_entry_bonus = 0
+    if volume and avg_vol and avg_vol > 0 and price > 0:
+        rel_v_now   = volume / avg_vol
+        entry_ideal = trade.get("entry_ideal", price)
+        near_entry  = abs(price - entry_ideal) / price < 0.015
+        if near_entry:
+            if   rel_v_now >= 2.5: volume_entry_bonus = 10
+            elif rel_v_now >= 1.8: volume_entry_bonus = 7
+            elif rel_v_now >= 1.3: volume_entry_bonus = 4
+            elif rel_v_now < 0.6:  volume_entry_bonus = -5
+
+    # ════════════════════════════════════════════════════════
+    # ج. سياق الموجة — هل التصحيح في ترند صاعد أم هبوط؟
+    # ════════════════════════════════════════════════════════
+    wave_context_bonus = 0
+    wave_context_label = ""
+    if price > 0:
+        trend_score_wave = 0
+        if sma20  and price > sma20:  trend_score_wave += 1
+        if sma50  and price > sma50:  trend_score_wave += 1
+        if sma200 and price > sma200: trend_score_wave += 1
+        in_healthy_pullback = (
+            sma50 and sma20 and
+            price > sma50 and
+            price < sma20 and
+            sma20 > sma50
+        )
+        if trend_score_wave == 3:
+            wave_context_bonus = 8
+            wave_context_label = "ترند صاعد قوي"
+        elif trend_score_wave == 2 and in_healthy_pullback:
+            wave_context_bonus = 10
+            wave_context_label = "تصحيح صحي في ترند صاعد"
+        elif trend_score_wave == 2:
+            wave_context_bonus = 5
+            wave_context_label = "ترند صاعد جزئي"
+        elif trend_score_wave == 0:
+            wave_context_bonus = -8
+            wave_context_label = "ترند هابط"
+        elif trend_score_wave == 1:
+            wave_context_bonus = -3
+            wave_context_label = "ترند مختلط"
+
+    score_adj = max(0, min(100, score + div_bonus + conf_bonus
+                                      + confluence_bonus
+                                      + volume_entry_bonus
+                                      + wave_context_bonus))
 
     # إعادة تصنيف الإشارة بالـ score المحسّن
     if score_adj != score:
@@ -3154,16 +3305,67 @@ def analyze_stock(sym: str, d: Dict[str, Any]) -> Optional[AnalysisResult]:
             bb_upper, bb_lower, bb_basis, adx)
         score = score_adj
 
-    # وقف الخسارة المتحرك
+    # قوة المقاومة القادمة (لازم قبل الفلتر)
+    resistance_info = calc_resistance_strength(price, high52, pivots, fib)
+
+    # ════════════════════════════════════════════════════════
+    # د. R:R كشرط إجباري + فلتر الإشارة الكامل
+    # ════════════════════════════════════════════════════════
+    signal_filter_reason = ""
+
+    if sig_type in ("BUY_STRONG", "BUY"):
+
+        rr1 = trade.get("rr1", 0)
+        if rr1 < 1.5:
+            sig_type            = "ACCUMULATE"
+            label               = "تجميع — R:R ضعيف"
+            color               = "#ffeb3b"
+            emoji               = "📦"
+            signal_filter_reason = f"R:R = {rr1:.1f} أقل من 1.5"
+
+        elif confirmation["bull_count"] < 2:
+            sig_type            = "ACCUMULATE"
+            label               = "تجميع"
+            color               = "#ffeb3b"
+            emoji               = "📦"
+            signal_filter_reason = f"تأكيد ضعيف ({confirmation['bull_count']} مؤشر فقط)"
+
+        elif wave_context_bonus <= -8:
+            sig_type            = "WAIT"
+            label               = "انتظار — ترند هابط"
+            color               = "#b0bec5"
+            emoji               = "⏳"
+            signal_filter_reason = wave_context_label
+
+        elif candle and candle["type"] == "BEARISH" and candle["name"] in ("شهاب ⭐", "هابطة قوية"):
+            sig_type            = "WAIT"
+            label               = "انتظار"
+            color               = "#b0bec5"
+            emoji               = "⏳"
+            signal_filter_reason = f"شمعة هبوط: {candle['name']}"
+
+        else:
+            nearest_list = resistance_info.get("nearest", [])
+            t1 = trade.get("targets", [None])[0]
+            if nearest_list and t1:
+                closest_r = nearest_list[0]
+                r_level   = closest_r["level"]
+                r_dist    = closest_r["dist_pct"]
+                r_strong  = closest_r["strength"] >= 2
+                if r_dist < 2.0 and r_strong and r_level < t1:
+                    sig_type            = "WAIT"
+                    label               = "انتظار — مقاومة قريبة"
+                    color               = "#b0bec5"
+                    emoji               = "⏳"
+                    signal_filter_reason = f"مقاومة عند {r_level} (بُعد {r_dist:.1f}%)"
+
+    # وقف الخسارة المتحرك (بعد الفلتر)
     trailing_stops = calc_trailing_stops(
         trade.get("entry_ideal"),
         trade.get("stop_loss"),
         trade.get("near_targets", []),
         trade.get("targets", []),
         sig_type)
-
-    # قوة المقاومة القادمة
-    resistance_info = calc_resistance_strength(price, high52, pivots, fib)
 
     # Position Sizing (بدون رأس مال — يُحسب في الـ frontend)
     # نحفظ المعطيات فقط، الحساب بيتم في الـ frontend لما يدخل رأس المال
@@ -3176,6 +3378,29 @@ def analyze_stock(sym: str, d: Dict[str, Any]) -> Optional[AnalysisResult]:
 
     # وقت الدخول الأمثل
     entry_time_hint = calc_optimal_entry_time()
+
+    # ════════════════════════════════════════════════════════════
+    # التحليلات المتقدمة
+    # ════════════════════════════════════════════════════════════
+    tf_alignment = assess_timeframe_alignment(d)
+
+    # بناء dict مؤقت للتحليلات المتقدمة
+    _analysis = {
+        "signal_type": sig_type,
+        "pivots": pivots,
+        "candle": candle,
+        "trade": trade,
+        "confirmation": confirmation,
+    }
+
+    harmonic = detect_harmonic_pattern(d, _analysis)
+    ml_result = calculate_ml_confidence(d, _analysis, regime=None, tf=tf_alignment, harmonic=harmonic)
+    kelly = calculate_kelly_size(
+        ml_result["ml_score"],
+        trade.get("rr1", 1.0),
+        trade.get("risk_pct", 2.0),
+        DEFAULT_CAPITAL,
+    )
 
     return {
         "score":            score_adj,
@@ -3195,9 +3420,18 @@ def analyze_stock(sym: str, d: Dict[str, Any]) -> Optional[AnalysisResult]:
         "divergences":      divergences,
         "confirmation":     confirmation,
         "trailing_stops":   trailing_stops,
-        "resistance_info":  resistance_info,
+        "resistance_info":       resistance_info,
+        "signal_filter_reason":  signal_filter_reason,
+        "wave_context":          wave_context_label,
+        "confluence_bonus":      confluence_bonus,
         "position_data":    position_data,
         "entry_time_hint":  entry_time_hint,
+        # التحليلات المتقدمة
+        "timeframe_alignment": tf_alignment,
+        "ml_confidence": ml_result,
+        "harmonic_pattern": harmonic,
+        "kelly": kelly,
+        "market_regime": None,   # تُملأ لاحقاً في api.py
     }
 
 
@@ -3252,7 +3486,7 @@ ACTION_TRAIL_STOP = "TRAIL_STOP"
 BUY_SIGNALS = ("BUY_STRONG", "BUY", "ACCUMULATE")
 
 # سيناريوهات الدخول المسموح بها
-ENTRY_SCENARIOS_ALLOWED = ("MARKET", "NEAR")
+ENTRY_SCENARIOS_ALLOWED = ("MARKET",)
 
 # توزيع الكمية على الأهداف (30% / 30% / 40%)
 Q1_RATIO = 0.10  # near_t1
@@ -3465,6 +3699,584 @@ def build_signal_card(
     lines.append(f"{'━' * 36}")
     card["text"] = "\n".join(lines)
     return card
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 18. Market Regime Detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_market_regime(stocks: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    كشف نظام السوق الحالي بناءً على ADX الكلي، عرض السوق، Bollinger Bandwidth EGX30
+    يحدد: ترند صاعد/هابط، تذبذب، تقلبات عالية/منخفضة
+    """
+    adx_vals = []
+    bb_widths = []
+    rsi_vals = []
+    adv_count = 0
+    total = len(stocks) or 1
+
+    for sym, v in stocks.items():
+        vd = v if isinstance(v, dict) else (v.to_dict() if hasattr(v, "to_dict") else {})
+        adx = vd.get("adx") or 0
+        bb_u = vd.get("bb_upper") or 0
+        bb_l = vd.get("bb_lower") or 0
+        bb_b = vd.get("bb_basis") or 0
+        rsi = vd.get("rsi") or 50
+        if adx > 0:
+            adx_vals.append(adx)
+        if bb_u and bb_l and bb_b and bb_b > 0:
+            bw = (bb_u - bb_l) / bb_b * 100
+            bb_widths.append(bw)
+        if rsi:
+            rsi_vals.append(rsi)
+        if (vd.get("change_pct") or 0) > 0:
+            adv_count += 1
+
+    avg_adx = np.mean(adx_vals) if adx_vals else 20
+    avg_bbw = np.mean(bb_widths) if bb_widths else 15
+    avg_rsi = np.mean(rsi_vals) if rsi_vals else 50
+    adv_pct = adv_count / total * 100
+
+    # تحديد النظام
+    if avg_adx >= 30 and adv_pct >= 60:
+        regime = "ترند صاعد قوي"
+        regime_en = "STRONG_UPTREND"
+        regime_score = 1.0
+    elif avg_adx >= 30 and adv_pct <= 40:
+        regime = "ترند هابط قوي"
+        regime_en = "STRONG_DOWNTREND"
+        regime_score = -1.0
+    elif avg_adx >= 25 and adv_pct >= 55:
+        regime = "ترند صاعد"
+        regime_en = "UPTREND"
+        regime_score = 0.6
+    elif avg_adx >= 25 and adv_pct <= 45:
+        regime = "ترند هابط"
+        regime_en = "DOWNTREND"
+        regime_score = -0.6
+    elif avg_rsi >= 60 and avg_bbw > 20:
+        regime = "تشبع صاعد + تقلبات"
+        regime_en = "OVERBOUGHT_VOLATILE"
+        regime_score = -0.3
+    elif avg_rsi <= 40 and avg_bbw > 20:
+        regime = "تشبع هابط + تقلبات"
+        regime_en = "OVERSOLD_VOLATILE"
+        regime_score = 0.3
+    else:
+        regime = "تذبذب جانبي"
+        regime_en = "RANGING"
+        regime_score = 0.0
+
+    # التقلبية
+    if avg_bbw > 25:
+        volatility = "مرتفعة 🔥"
+        vol_level = 2
+    elif avg_bbw > 15:
+        volatility = "متوسطة"
+        vol_level = 1
+    else:
+        volatility = "منخفضة"
+        vol_level = 0
+
+    return {
+        "regime": regime,
+        "regime_en": regime_en,
+        "regime_score": regime_score,
+        "avg_adx": round(avg_adx, 1),
+        "avg_bbw": round(avg_bbw, 1),
+        "avg_rsi": round(avg_rsi, 1),
+        "adv_pct": round(adv_pct, 1),
+        "volatility": volatility,
+        "vol_level": vol_level,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 19. Multiple Timeframe Assessment
+# ══════════════════════════════════════════════════════════════════════════════
+
+def assess_timeframe_alignment(v: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    تقييم توافق الإطار الزمني للسهم
+    يستخدم perf_w/perf_1m/perf_3m كبديل للإطارات الزمنية المتعددة
+    """
+    price = v.get("price") or 0
+    sma50 = v.get("sma50") or 0
+    sma200 = v.get("sma200") or 0
+    perf_w = v.get("perf_w") or 0
+    perf_1m = v.get("perf_1m") or 0
+    perf_3m = v.get("perf_3m") or 0
+    high52 = v.get("high52w") or 0
+    low52 = v.get("low52w") or 0
+
+    # الاتجاه الأسبوعي
+    if perf_w > 3:
+        weekly_trend = "صاعد ↑"
+        weekly_score = 1
+    elif perf_w > 0:
+        weekly_trend = "ميل صاعد ↗"
+        weekly_score = 0.5
+    elif perf_w > -3:
+        weekly_trend = "هابط ↓"
+        weekly_score = -0.5
+    else:
+        weekly_trend = "هابط قوي 🔻"
+        weekly_score = -1
+
+    # الاتجاه الشهري
+    if perf_1m > 5:
+        monthly_trend = "صاعد ↑"
+        monthly_score = 1
+    elif perf_1m > 0:
+        monthly_trend = "ميل صاعد ↗"
+        monthly_score = 0.5
+    elif perf_1m > -5:
+        monthly_trend = "هابط ↓"
+        monthly_score = -0.5
+    else:
+        monthly_trend = "هابط قوي 🔻"
+        monthly_score = -1
+
+    # الموضع في نطاق 52 أسبوع
+    range_pos = ((price - low52) / (high52 - low52) * 100) if (high52 > low52) else 50
+
+    # العلاقة مع المتوسطات
+    above_sma50 = price > sma50 if sma50 else True
+    above_sma200 = price > sma200 if sma200 else True
+
+    # alignment بين الإطارات
+    alignment = weekly_score + monthly_score * 0.5
+    if above_sma50:
+        alignment += 0.5
+    if above_sma200:
+        alignment += 0.5
+    if range_pos > 60:
+        alignment += 0.3
+    elif range_pos < 30:
+        alignment -= 0.3
+
+    if alignment >= 2:
+        aligned = "توافق صاعد قوي ✅✅"
+        aligned_score = 1.0
+    elif alignment >= 1:
+        aligned = "توافق صاعد ✅"
+        aligned_score = 0.6
+    elif alignment <= -2:
+        aligned = "توافق هابط قوي ❌❌"
+        aligned_score = -1.0
+    elif alignment <= -1:
+        aligned = "توافق هابط ❌"
+        aligned_score = -0.6
+    else:
+        aligned = "محايد ↔"
+        aligned_score = 0.0
+
+    return {
+        "weekly_trend": weekly_trend,
+        "weekly_score": weekly_score,
+        "monthly_trend": monthly_trend,
+        "monthly_score": monthly_score,
+        "range_52w_pos": round(range_pos, 1),
+        "above_sma50": above_sma50,
+        "above_sma200": above_sma200,
+        "alignment": aligned,
+        "alignment_score": round(aligned_score, 2),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 20. ML Confidence Model (Adaptive Weighted Ensemble)
+# ══════════════════════════════════════════════════════════════════════════════
+
+ML_WEIGHTS_FILE = DATA_DIR / "ml_weights.json"
+
+def _load_ml_weights() -> Dict[str, float]:
+    """تحميل أوزان ML من ملف"""
+    try:
+        if ML_WEIGHTS_FILE.exists():
+            return json.loads(ML_WEIGHTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    # أوزان افتراضية أولية (تتحسن مع الوقت)
+    return {
+        "rsi_extreme": 1.5, "adx_trend": 1.2, "bb_reversal": 1.0,
+        "volume_confirm": 0.8, "perf_momentum": 1.0, "sma_alignment": 1.2,
+        "range_position": 0.6, "bull_confirmation": 1.3, "bear_penalty": 1.0,
+        "timeframe_align": 1.4, "regime_match": 1.5, "harmonic_conf": 1.8,
+    }
+
+
+def _save_ml_weights(weights: Dict[str, float]) -> None:
+    """حفظ أوزان ML"""
+    try:
+        ML_WEIGHTS_FILE.write_text(json.dumps(weights, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def calculate_ml_confidence(v: Dict[str, Any], a: Dict[str, Any],
+                             regime: Optional[Dict] = None,
+                             tf: Optional[Dict] = None,
+                             harmonic: Optional[Dict] = None) -> Dict[str, Any]:
+    """
+    حساب درجة الثقة باستخدام weighted ensemble من المؤشرات
+    ML confidence score using adaptive weighted ensemble
+    """
+    t = a.get("trade", {})
+    conf = a.get("confirmation", {})
+
+    weights = _load_ml_weights()
+    score = 0.0
+    total_weight = 0.0
+    signals_detail = []
+
+    # 1. RSI Extreme
+    rsi = v.get("rsi") or 50
+    if rsi < 30:
+        rsi_score = 1.0
+        rsi_label = "تشبع بيع قوي"
+    elif rsi < 38:
+        rsi_score = 0.6
+        rsi_label = "تشبع بيع"
+    elif rsi > 70:
+        rsi_score = 1.0
+        rsi_label = "تشبع شراء قوي (احذر)"
+    elif rsi > 62:
+        rsi_score = 0.6
+        rsi_label = "تشبع شراء (احذر)"
+    else:
+        rsi_score = 0.3
+        rsi_label = "محايد"
+
+    # عكس الإشارة للتشبع الشراء
+    sig_type = a.get("signal_type", "")
+    is_buy = sig_type in ("BUY_STRONG", "BUY", "ACCUMULATE")
+    if is_buy and rsi > 60:
+        rsi_score = -0.5  # buy signal + overbought = weak
+    elif not is_buy and rsi < 40:
+        rsi_score = -0.5  # sell signal + oversold = weak
+
+    score += rsi_score * weights["rsi_extreme"]
+    total_weight += weights["rsi_extreme"]
+    signals_detail.append({"name": f"RSI ({rsi:.0f})", "score": rsi_score, "weight": weights["rsi_extreme"]})
+
+    # 2. ADX Trend Confirmation
+    adx = v.get("adx") or 0
+    if adx >= 30:
+        adx_score = 1.0
+        adx_label = "ترند قوي ✓"
+    elif adx >= 20:
+        adx_score = 0.6
+        adx_label = "ترند متوسط"
+    else:
+        adx_score = 0.0
+        adx_label = "بدون ترند"
+
+    score += adx_score * weights["adx_trend"]
+    total_weight += weights["adx_trend"]
+    signals_detail.append({"name": f"ADX ({adx:.0f})", "score": adx_score, "weight": weights["adx_trend"]})
+
+    # 3. Bollinger Position
+    bb_u = v.get("bb_upper") or 0
+    bb_l = v.get("bb_lower") or 0
+    price = v.get("price") or 0
+    bb_pos = 0
+    if bb_u and bb_l and bb_u > bb_l:
+        bb_pos = (price - bb_l) / (bb_u - bb_l) * 100
+        if is_buy and bb_pos < 20:
+            bb_score = 1.0  # buy near lower band
+        elif is_buy and bb_pos > 80:
+            bb_score = -0.5  # buy near upper band = bad
+        elif not is_buy and bb_pos > 80:
+            bb_score = 1.0  # sell near upper band
+        elif not is_buy and bb_pos < 20:
+            bb_score = -0.5
+        else:
+            bb_score = 0.3
+    else:
+        bb_score = 0.0
+
+    score += bb_score * weights["bb_reversal"]
+    total_weight += weights["bb_reversal"]
+    signals_detail.append({"name": f"Bollinger ({bb_pos:.0f}%)", "score": bb_score, "weight": weights["bb_reversal"]})
+
+    # 4. Volume Confirmation
+    rel_vol = v.get("rel_vol") or 0
+    if rel_vol > 2:
+        vol_score = 1.0
+    elif rel_vol > 1.2:
+        vol_score = 0.6
+    elif rel_vol > 0.5:
+        vol_score = 0.3
+    else:
+        vol_score = 0.0
+
+    score += vol_score * weights["volume_confirm"]
+    total_weight += weights["volume_confirm"]
+    signals_detail.append({"name": f"حجم (×{rel_vol:.1f})", "score": vol_score, "weight": weights["volume_confirm"]})
+
+    # 5. Multi-month Momentum
+    perf_1m = v.get("perf_1m") or 0
+    perf_3m = v.get("perf_3m") or 0
+    mom = (perf_1m * 0.6 + perf_3m * 0.4) / 10
+    mom_score = max(-1, min(1, mom))
+    score += mom_score * weights["perf_momentum"]
+    total_weight += weights["perf_momentum"]
+    signals_detail.append({"name": f"زخم ({perf_1m:.1f}%)", "score": mom_score, "weight": weights["perf_momentum"]})
+
+    # 6. SMA Alignment
+    sma50 = v.get("sma50") or 0
+    sma200 = v.get("sma200") or 0
+    sma_score = 0.0
+    if price and sma50 and sma200:
+        if price > sma200 and price > sma50 and sma50 > sma200:
+            sma_score = 1.0  # golden alignment
+        elif price > sma200 and price > sma50:
+            sma_score = 0.6
+        elif price < sma200 and price < sma50 and sma50 < sma200:
+            sma_score = -0.6
+        elif price < sma200 or price < sma50:
+            sma_score = -0.3
+
+    score += sma_score * weights["sma_alignment"]
+    total_weight += weights["sma_alignment"]
+    signals_detail.append({"name": "SMA ترتيب", "score": sma_score, "weight": weights["sma_alignment"]})
+
+    # 7. 52-week Range Position
+    high52 = v.get("high52w") or 0
+    low52 = v.get("low52w") or 0
+    range_pct = 0
+    if high52 > low52 and price:
+        range_pct = (price - low52) / (high52 - low52)
+        if is_buy and range_pct < 0.3:
+            range_score = 1.0  # buy near bottom
+        elif is_buy and range_pct > 0.7:
+            range_score = 0.3  # buy near top but momentum
+        elif not is_buy and range_pct > 0.7:
+            range_score = 1.0  # sell near top
+        else:
+            range_score = 0.3
+    else:
+        range_score = 0.0
+
+    score += range_score * weights["range_position"]
+    total_weight += weights["range_position"]
+    signals_detail.append({"name": f"نطاق 52أ ({range_pct*100:.0f}%)", "score": range_score, "weight": weights["range_position"]})
+
+    # 8. Bull/Bear Confirmation
+    bull_c = conf.get("bull_count", 0)
+    bear_c = conf.get("bear_count", 0)
+    confirm_score = (bull_c - bear_c) / max(bull_c + bear_c, 1)
+    score += confirm_score * weights["bull_confirmation"]
+    total_weight += weights["bull_confirmation"]
+    signals_detail.append({"name": f"تأكيد (+{bull_c}/-{bear_c})", "score": confirm_score, "weight": weights["bull_confirmation"]})
+
+    # 9. Timeframe Alignment (from external parameter)
+    if tf:
+        tf_score = tf.get("alignment_score", 0)
+        score += tf_score * weights["timeframe_align"]
+        total_weight += weights["timeframe_align"]
+        signals_detail.append({"name": tf.get("alignment", ""), "score": tf_score, "weight": weights["timeframe_align"]})
+
+    # 10. Regime Match (from external parameter)
+    # لو السهم طالع عكس السوق الهابط، ما يتعاقبش — ده قوة نسبية
+    if regime:
+        regime_s = regime.get("regime_score", 0)
+        tf_score = tf.get("alignment_score", 0) if tf else 0
+        if is_buy:
+            if regime_s > 0:
+                reg_score = regime_s  # سوق صاعد + شراء = تأكيد
+            elif tf_score >= 0.3:
+                reg_score = 0.2       # السهم طالع عكس السوق = قوة نسبية
+            else:
+                reg_score = 0         # محايد — ما نضفش وزن للبساط ولا للمقام
+        else:
+            if regime_s < 0:
+                reg_score = -regime_s  # سوق هابط + بيع = تأكيد
+            elif tf_score <= -0.3:
+                reg_score = 0.2        # السهم نازل عكس السوق
+            else:
+                reg_score = 0
+        if reg_score > 0:
+            score += reg_score * weights["regime_match"]
+            if reg_score >= 0.3:
+                total_weight += weights["regime_match"]
+            # reg_score 0.2 = bonus only without diluting the denominator
+        signals_detail.append({"name": f"نظام السوق", "score": reg_score, "weight": weights["regime_match"]})
+
+    # 11. Harmonic Pattern (from external parameter)
+    if harmonic and harmonic.get("confidence", 0) > 0:
+        harm_score = harmonic["confidence"] / 100
+        score += harm_score * weights["harmonic_conf"]
+        total_weight += weights["harmonic_conf"]
+        signals_detail.append({"name": harmonic.get("pattern", ""), "score": harm_score, "weight": weights["harmonic_conf"]})
+
+    # Normalize
+    ml_score = (score / total_weight * 100) if total_weight > 0 else 50
+    ml_score = max(0, min(100, ml_score))
+
+    # تصنيف
+    if ml_score >= 80:
+        ml_label = "ثقة عالية جداً 🧠"
+    elif ml_score >= 65:
+        ml_label = "ثقة عالية 🧠"
+    elif ml_score >= 50:
+        ml_label = "ثقة متوسطة"
+    elif ml_score >= 35:
+        ml_label = "ثقة منخفضة ⚠️"
+    else:
+        ml_label = "ضعيف — يُفضل الانتظار ❌"
+
+    return {
+        "ml_score": round(ml_score, 1),
+        "ml_label": ml_label,
+        "signals_detail": sorted(signals_detail, key=lambda x: abs(x["score"] * x["weight"]), reverse=True),
+    }
+
+
+def update_ml_weights(outcome: str, features: Dict[str, float]) -> None:
+    """
+    تحديث أوزان ML بعد نتيجة إشارة (يكسب/خسارة)
+    Bayesian update: increase weight of features that predicted correctly
+    """
+    weights = _load_ml_weights()
+    is_win = outcome in ("WIN", "TARGETS")
+    adj = 1.05 if is_win else 0.95
+    for key in weights:
+        weights[key] = round(weights[key] * adj, 4)
+    _save_ml_weights(weights)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 21. Kelly Criterion Position Sizing
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calculate_kelly_size(ml_score: float, rr1: float, risk_pct: float, capital: float) -> Dict[str, Any]:
+    """
+    حساب حجم الصفقة باستخدام معيار كيلي
+    Kelly Criterion: f* = (p(b+1) - 1) / b
+    """
+    p = ml_score / 100  # احتمال الربح
+    b = rr1             # نسبة الربح إلى المخاطرة
+    q = 1 - p           # احتمال الخسارة
+
+    if b > 0:
+        kelly_raw = (p * (b + 1) - 1) / b
+    else:
+        kelly_raw = p - q  # fallback
+
+    # كاب كيلي عند 25% من رأس المال
+    kelly_raw = max(0, min(0.25, kelly_raw))
+
+    # Fractional Kelly (نصف كيلي للأمان)
+    kelly_frac = kelly_raw * 0.5
+
+    # المقارنة مع النسبة الثابتة
+    current_risk_egp = capital * risk_pct / 100
+
+    # إذا كيلي > النسبة الثابتة → استخدم كيلي (بحد أقصى 2x)
+    risk_pct_adjusted = max(risk_pct, min(risk_pct * 2, kelly_frac * 100))
+
+    return {
+        "kelly_pct": round(kelly_raw * 100, 1),
+        "kelly_frac_pct": round(kelly_frac * 100, 1),
+        "kelly_egp": round(capital * kelly_frac, 0),
+        "suggested_risk_pct": round(risk_pct_adjusted, 1),
+        "higher_than_default": risk_pct_adjusted > risk_pct,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 22. Harmonic Pattern Detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_harmonic_pattern(v: Dict[str, Any], a: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    كشف الأنماط التوافقية (Harmonic Patterns) باستخدام نسب فيبوناتشي
+    Gartley, Butterfly, Bat, Crab
+    """
+    price = v.get("price") or 0
+    high52 = v.get("high52w") or 0
+    low52 = v.get("low52w") or 0
+    high3m = v.get("high3m") or 0
+    low3m = v.get("low3m") or 0
+    high1m = v.get("high1m") or 0
+    low1m = v.get("low1m") or 0
+    pivots = a.get("pivots", {})
+    pp = pivots.get("PP") or 0
+
+    # نقاط swing تقريبية من المتاح
+    # X = high52, A = low52 (لنمط صاعد)، أو العكس (لنمط هابط)
+    swing_high = high52
+    swing_low = low52
+    mid_high = high3m or high1m
+    mid_low = low3m or low1m
+
+    if not all([swing_high, swing_low, price]):
+        return None
+
+    # حساب النسب
+    range_ = swing_high - swing_low
+    if range_ <= 0:
+        return None
+
+    # النمط 1: Gartley (XA = 61.8%, AB = 38.2-61.8% من XA)
+    xa_retrace = (price - swing_low) / range_ * 100
+    ab_range = (mid_high - mid_low) / range_ * 100 if mid_high and mid_low else 50
+
+    patterns = []
+
+    # Gartley Bullish: X=high, A=low, B=38.2-61.8% retrace of XA
+    # C = 61.8-78.6% retrace of AB
+    # D = 78.6% retrace of XA = entry
+    if 38 <= xa_retrace <= 62 and 38 <= ab_range <= 62:
+        patterns.append({
+            "pattern": "Gartley",
+            "direction": "صاعد" if xa_retrace < 50 else "هابط",
+            "confidence": min(80, 50 + abs(50 - xa_retrace)),
+            "entry_zone": f"{round(swing_low + 0.786 * range_, 3)}–{round(swing_low + 0.886 * range_, 3)}",
+        })
+
+    # Butterfly: B = 78.6% retrace of XA
+    if 70 <= xa_retrace <= 85:
+        patterns.append({
+            "pattern": "Butterfly 🦋",
+            "direction": "صاعد" if xa_retrace < 78 else "هابط",
+            "confidence": min(85, 55 + abs(78 - xa_retrace)),
+            "entry_zone": f"{round(swing_low + 1.27 * range_, 3)}–{round(swing_low + 1.618 * range_, 3)}",
+        })
+
+    # Bat: B = 38.2-50% retrace of XA
+    if 38 <= xa_retrace <= 52:
+        patterns.append({
+            "pattern": "Bat 🦇",
+            "direction": "صاعد" if xa_retrace < 45 else "هابط",
+            "confidence": min(80, 50 + abs(45 - xa_retrace)),
+            "entry_zone": f"{round(swing_low + 0.886 * range_, 3)}",
+        })
+
+    # Crab: B = 61.8-88.6% retrace of XA
+    if 61 <= xa_retrace <= 88:
+        patterns.append({
+            "pattern": "Crab 🦀",
+            "direction": "صاعد" if xa_retrace < 75 else "هابط",
+            "confidence": min(90, 60 + abs(75 - xa_retrace)),
+            "entry_zone": f"{round(swing_low + 1.618 * range_, 3)}",
+        })
+
+    if not patterns:
+        return None
+
+    # رتب حسب الثقة واختر أعلى واحد
+    best = max(patterns, key=lambda p: p["confidence"])
+    return {
+        "patterns": patterns,
+        "best": best["pattern"],
+        "direction": best["direction"],
+        "confidence": best["confidence"],
+        "entry_zone": best["entry_zone"],
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -44,6 +44,56 @@
 ## نشر على Replit
 - Import من GitHub: https://github.com/ashraf52705270/egx-analyzer
 
+## آخر التعديلات (20 مايو 2026)
+
+### تصحيح `detect_market_distribution()` في `engine.py:1153`
+- الدالة بتستقبل `stocks: Dict[str, StockData]` مش `Dict[str, dict]`
+- حصل `AttributeError: 'StockData' object has no attribute 'get'` لأنها كانت بتستخدم `v.get("price", 0)`
+- التصحيح: استخدام `isinstance(v, dict)` للتفريق، وتحويل `StockData` → dict via `vars(v)`:
+  ```python
+  vd = v if isinstance(v, dict) else vars(v)
+  ```
+- دا سبب إن البانر/البادجات ما كانتش تظهر — المحرك كان بيكراش في أول دورة
+
+### إضافة كشف صرف/تجميع سوقي
+- دالة `detect_market_distribution()` في `engine.py`:
+  - تحسب `advancing_pct`, `below_open_pct`, `volume_surge_red/green`, `near_low/high_pct`
+  - ترجع `state` (صرف/تجميع/عادي), `severity` (0–5), `warnings`
+- `_execute_cycle()` في `engine.py:308` تستدعيها كل دورة
+- لو `severity >= 4` للصرف → `block_new = True` (يمنع فتح صفقات جديدة)
+- لو `severity >= 3` للتجميع → تخفيف عتبات الدخول (min_quality=50, min_rr=1.2, min_liq=25, min_confirm=2, min_adx=12, min_rel_vol=0.3)
+
+### واجهة المستخدم — بانر وبادجات
+- `index.html`:
+  - `marketDistBanner` (line 1594): بانر أحمر/أخضر/أصفر فوق بطاقات أفضل الفرص
+  - `_marketDistribution` (line 2099): قراءة من `/api/top`
+  - `renderOppCards()` (line 3008-3016): بادج لكل سهم:
+    - `md.distribution && severity >= 4` → 🚫 صرف جماعي
+    - `md.accumulation && severity >= 3` → ✅ تجميع سوقي
+    - غير كده → ✅/🎯/⏳ العادية
+
+### API
+- `/api/top` يرجع `market_distribution` كحقل رئيسي + كل سهم فيه `market_distribution` في الكارد
+- `/api/settings` يدعم `test_mode: bool` — بيدخل في SettingsUpdate (line 126)
+- `/api/engine/status` يرجع `running`, `mode`, `daily_pnl`, إلخ
+
+### ترشيح الإشارات
+- `renderAutoSignals()` (index.html): بتعرض بس OPEN signals
+- `renderTrades()`: بتعرض بس open/active trades (الـ closed مختفية)
+- `Trade.to_dict()` في `database.py`: فيها `auto: self.signal_log_id is not None`
+
+### حفظ التواريخ
+- `_dict_to_trade()` في `database.py`: بتحافظ على `entry_date`/`exit_date` من JSON (parsing `fromisoformat`)
+- `to_dict()` في `database.py`: كانت ناقصة `auto` — اتضافت
+- `_open_trade()` في `engine.py`: الـ `notes` دلوقتي dict مش string
+
+### تشغيل السيرفر على Windows
+- `python main.py` من مجلد EGX Analyzer
+- أو double-click `EGX Analyzer.lnk` على سطح المكتب
+- بعد إعادة التشغيل، لو عايز المحرك يشتغل بره ساعات التداول: شغّل `test_mode` من الإعدادات أو POST `/api/settings` بـ `{"test_mode": true}`
+- أحياناً PowerShell بيلخبط في التشفير: استخدم `$env:PYTHONIOENCODING='utf-8'` قبل أي أمر Python inline
+- `detect_market_distribution()` ممكن تبوظ لو `StockData` متحولش dict — التصحيح فوق
+
 ## PIN للمساعدة
 - المستخدم بيتكلم عربى
 - يفضل اختصار فى الردود

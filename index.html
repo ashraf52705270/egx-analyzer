@@ -2673,6 +2673,8 @@ async function loadAll() {
   updateStatus(j.count, j.age_sec);
 }
 
+let _marketRegime = null;
+
 async function loadTop() {
   try {
     const r = await fetchWithTimeout('/api/top', 15000);
@@ -2680,6 +2682,7 @@ async function loadTop() {
     if (j.ok) {
       TOP_DATA = j.top || [];
       _marketDistribution = j.market_distribution || {distribution: false, severity: 0};
+      _marketRegime = j.market_regime || null;
     }
   } catch(e) { TOP_DATA = []; }
 }
@@ -2920,49 +2923,51 @@ function renderOpportunities() {
     return true;
   });
 
-  // عرض تحذير/تنبيه حالة السوق
+  // عرض شريط حالة السوق (بانر واحد يجمع نظام السوق + توزيع السوق)
+  const regime = _marketRegime || {};
   const dist = _marketDistribution || {};
   const distBanner = document.getElementById('marketDistBanner');
   if (distBanner) {
+    let bg, border, icon, title, sub;
     if (dist.accumulation && dist.severity >= 3) {
-      distBanner.innerHTML = `
-        <div style="background:#27ae60;color:#fff;padding:10px 16px;border-radius:8px;margin-bottom:12px;
-                    display:flex;align-items:center;gap:10px;font-size:14px;direction:rtl">
-          <span style="font-size:20px">✅</span>
-          <div style="flex:1">
-            <strong style="font-size:15px">تجميع سوقي — ${dist.level || 'قوي'}</strong>
-            <div style="font-size:13px;opacity:0.9;margin-top:2px">
-              ${(dist.warnings || []).join(' • ')}
-            </div>
-          </div>
-          <span style="font-size:13px;opacity:0.85">${dist.advancing_pct || 0}% صاعدة</span>
-        </div>`;
-      distBanner.style.display = '';
+      bg = '#27ae60'; border = '#27ae60'; icon = '✅';
+      title = `تجميع سوقي — ${dist.level || 'قوي'}`;
+      sub = (dist.warnings || []).join(' • ');
     } else if (dist.distribution) {
-      const severity = dist.severity || 0;
-      const colors = ['', '', 'var(--accent-yellow)', '#ff6b35', '#e74c3c', '#c0392b'];
-      const icons = ['', '', '⚠️', '⚠️', '🚫', '🚫'];
+      const sev = dist.severity || 0;
       const sevLabels = ['', 'خفيف', 'متوسط', 'مرتفع', 'شديد', 'شديد جداً'];
-      distBanner.innerHTML = `
-        <div style="background:${colors[severity] || '#e74c3c'};color:#fff;padding:10px 16px;border-radius:8px;margin-bottom:12px;
-                    display:flex;align-items:center;gap:10px;font-size:14px;direction:rtl">
-          <span style="font-size:20px">${icons[severity] || '⚠️'}</span>
-          <div style="flex:1">
-            <strong style="font-size:15px">صرف جماعي — ${sevLabels[severity] || 'مرتفع'}</strong>
-            <div style="font-size:13px;opacity:0.9;margin-top:2px">
-              ${(dist.warnings || []).join(' • ')}
-            </div>
-          </div>
-          <span style="font-size:13px;opacity:0.85">${dist.advancing_pct || 0}% صاعدة</span>
-        </div>`;
-      distBanner.style.display = '';
+      bg = ['', '', 'var(--accent-yellow)', '#ff6b35', '#e74c3c', '#c0392b'][sev] || '#e74c3c';
+      border = bg; icon = ['', '', '⚠️', '⚠️', '🚫', '🚫'][sev] || '⚠️';
+      title = `صرف جماعي — ${sevLabels[sev] || 'مرتفع'}`;
+      sub = (dist.warnings || []).join(' • ');
     } else if (dist.severity > 0) {
-      // عرض تحذير بسيط لو الخفيف
+      bg = 'var(--accent-yellow)'; border = bg; icon = '⚠️';
+      title = `حذر: ${dist.advancing_pct || 0}% فقط من الأسهم صاعدة`;
+      sub = '';
+    } else {
+      bg = ''; border = ''; icon = '📊'; title = ''; sub = '';
+    }
+    // لو فيه نظام سوق ومفيش حالة توزيع قوية، نستخدم ألوان نظام السوق
+    if (!bg && regime.regime) {
+      const rColors = {'STRONG_UPTREND':'rgba(0,230,118,0.15)','UPTREND':'rgba(0,230,118,0.1)','STRONG_DOWNTREND':'rgba(252,129,129,0.15)','DOWNTREND':'rgba(252,129,129,0.1)','OVERBOUGHT_VOLATILE':'rgba(246,173,85,0.15)','OVERSOLD_VOLATILE':'rgba(98,114,164,0.15)','RANGING':'rgba(148,163,184,0.1)'};
+      const rBorders = {'STRONG_UPTREND':'rgba(0,230,118,0.3)','UPTREND':'rgba(0,230,118,0.2)','STRONG_DOWNTREND':'rgba(252,129,129,0.3)','DOWNTREND':'rgba(252,129,129,0.2)','OVERBOUGHT_VOLATILE':'rgba(246,173,85,0.3)','OVERSOLD_VOLATILE':'rgba(98,114,164,0.3)','RANGING':'rgba(148,163,184,0.2)'};
+      bg = rColors[regime.regime_en] || 'rgba(148,163,184,0.1)';
+      border = rBorders[regime.regime_en] || 'rgba(148,163,184,0.2)';
+    }
+    // بناء النص
+    const regimePart = regime.regime ? `نظام السوق: ${regime.regime} · ADX ${regime.avg_adx} · تقلبات ${regime.volatility}` : '';
+    const distPart = title ? (regimePart ? ` | ${title}` : title) : '';
+    const mainText = regimePart + distPart;
+    const summary = (dist.advancing_pct || dist.advancing_pct === 0) && (dist.accumulation || dist.distribution) ? `<span style="font-size:13px;opacity:0.85;white-space:nowrap">${dist.advancing_pct}% صاعدة</span>` : '';
+    if (mainText || sub) {
       distBanner.innerHTML = `
-        <div style="background:var(--accent-yellow);color:#000;padding:6px 12px;border-radius:6px;margin-bottom:10px;
-                    display:flex;align-items:center;gap:8px;font-size:13px;direction:rtl;opacity:0.8">
-          <span>⚠️</span>
-          <span>حذر: ${dist.advancing_pct || 0}% فقط من الأسهم صاعدة</span>
+        <div style="background:${bg};border:1px solid ${border};border-radius:8px;padding:10px 16px;margin-bottom:12px;display:flex;align-items:center;gap:10px;font-size:14px;direction:rtl;${bg.startsWith('rgba')?'':'color:#fff'}">
+          <span style="font-size:20px">${icon}</span>
+          <div style="flex:1">
+            <strong style="font-size:14px">${mainText}</strong>
+            ${sub ? `<div style="font-size:12px;opacity:0.9;margin-top:2px">${sub}</div>` : ''}
+          </div>
+          ${summary}
         </div>`;
       distBanner.style.display = '';
     } else {
@@ -3014,14 +3019,15 @@ function renderOpportunities() {
       readyBadge = `<span class="ready-badge" style="background:#27ae60;color:#fff">✅ تجميع سوقي — فرصة مواتية</span>`;
     } else if (md && md.distribution && md.severity >= 4) {
       readyBadge = `<span class="ready-badge" style="background:#c0392b;color:#fff">🚫 صرف جماعي — تجنب الدخول</span>`;
-    } else if (scenario === 'MARKET' || t.ready) {
+    } else if (scenario === 'MARKET') {
       readyBadge = `<span class="ready-badge ready">✅ ادخل الآن بسعر السوق</span>`;
     } else if (scenario === 'NEAR' || prox >= 70) {
       const distPct = t.entry ? ((t.price - t.entry)/t.price*100).toFixed(1) : prox.toFixed(0);
       readyBadge = `<span class="ready-badge near">🎯 قريب — السعر فوق الدخول بـ ${distPct}%</span>`;
     } else {
       const distPct = t.entry ? ((t.price - t.entry)/t.entry*100).toFixed(1) : '';
-      readyBadge = `<span class="ready-badge waiting">⏳ استنى — الدخول أدنى بـ ${distPct}%</span>`;
+      const inRange = t.ready ? ' (السعر في النطاق لكن بعيد عن الدعم — استنى التراجع)' : '';
+      readyBadge = `<span class="ready-badge waiting">⏳ استنى — الدخول أدنى بـ ${distPct}%${inRange}</span>`;
     }
 
     // quality ring color
@@ -3043,6 +3049,10 @@ function renderOpportunities() {
             ${tq.toFixed(0)}
           </div>
           <div style="font-size:10px;color:var(--text-muted);text-align:center">جودة</div>
+          ${t.ml_confidence ? `
+          <div style="margin-top:4px;padding:2px 6px;border-radius:4px;font-size:9px;font-weight:700;text-align:center;background:${t.ml_confidence.ml_score>=80?'rgba(0,230,118,0.2)':t.ml_confidence.ml_score>=65?'rgba(0,230,118,0.12)':t.ml_confidence.ml_score>=50?'rgba(246,224,94,0.15)':'rgba(252,129,129,0.15)'};color:${t.ml_confidence.ml_score>=80?'var(--accent-green)':t.ml_confidence.ml_score>=65?'var(--accent-green)':t.ml_confidence.ml_score>=50?'var(--accent-yellow)':'var(--accent-red)'}">
+            🧠 ${t.ml_confidence.ml_score}
+          </div>` : ''}
         </div>
       </div>
 
@@ -3106,31 +3116,18 @@ function renderOpportunities() {
           <div style="font-size:11px;color:var(--text-secondary)">${t.vol_class||'—'}</div>
         </div>
       </div>
-      ${t.candle ? `<div style="font-size:11px;padding:5px 8px;margin-top:4px;border-radius:6px;
-        background:${t.candle.type==='BULLISH'?'rgba(104,211,145,0.08)':t.candle.type==='BEARISH'?'rgba(252,129,129,0.08)':'rgba(255,255,255,0.04)'};
-        border:1px solid ${t.candle.type==='BULLISH'?'rgba(104,211,145,0.2)':t.candle.type==='BEARISH'?'rgba(252,129,129,0.2)':'rgba(255,255,255,0.08)'}">
-        🕯 ${t.candle.ar}
-      </div>` : ''}
-      ${t.engine_ready ? `<div style="font-size:11px;padding:4px 8px;margin-top:4px;border-radius:6px;background:rgba(179,122,237,0.1);border:1px solid rgba(179,122,237,0.3);display:flex;align-items:center;gap:5px">
-        🤖 <b style="color:var(--accent-purple)">جاهز للطيار الآلي</b>
-      </div>` : ''}
-      ${t.confirmation?.bull_count >= 3 ? `<div style="font-size:11px;padding:4px 8px;margin-top:4px;border-radius:6px;background:rgba(0,230,118,0.06);border:1px solid rgba(0,230,118,0.15)">
-        ✅ تأكيد: ${t.confirmation.label} (${t.confirmation.bull_count} مؤشر)
-      </div>` : ''}
-      ${t.divergences?.length ? `<div class="div-badge div-${t.divergences[0].type==='BULLISH'?'bull':'bear'}" style="margin-top:4px;font-size:10px">
-        ${t.divergences[0].ar}
-      </div>` : ''}
-      ${(t.resistance_info?.near_resistance) ? `<div style="font-size:10px;padding:3px 8px;margin-top:4px;border-radius:6px;background:rgba(246,173,85,0.08);color:var(--accent-orange)">
-        ${t.resistance_info.warning}
-      </div>` : ''}
       ${capital && t._max_shares && t.position_data ? (() => {
         const riskPct = parseFloat(document.getElementById('riskPctSelect')?.value||2);
         const rpe = t.position_data.risk_per_share || 0.01;
         const maxRisk = capital * riskPct / 100;
         const optShares = Math.min(t._max_shares, Math.floor(maxRisk / rpe));
         const optCost = (optShares * (t.entry||0)).toFixed(0);
+        // Kelly sizing
+        const kl = t.kelly || {};
+        const kellyStr = kl.suggested_risk_pct ? `🧮 Kelly: ${kl.kelly_pct}%` : '';
         return optShares > 0 ? `<div style="font-size:11px;padding:4px 8px;margin-top:4px;border-radius:6px;background:rgba(99,179,237,0.06);border:1px solid rgba(99,179,237,0.15)">
           💰 الكمية المثالية: <b>${optShares} سهم</b> = ${optCost} ج (مخاطرة ${riskPct}%)
+          ${kellyStr ? `<span style="margin-right:8px;color:var(--accent-cyan)">${kellyStr}</span>` : ''}
         </div>` : '';
       })() : ''}
     </div>`;
@@ -4606,6 +4603,7 @@ function renderTrades() {
         <thead><tr>
           <th onclick="setTradeSort('symbol')" style="cursor:pointer;padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border);user-select:none">الرمز${sortArrow('symbol')}</th>
           <th onclick="setTradeSort('entry')" style="cursor:pointer;padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border);user-select:none">الدخول${sortArrow('entry')}</th>
+          <th style="padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border)">السعر الحالي</th>
           <th onclick="setTradeSort('pnl')" style="cursor:pointer;padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border);user-select:none">الربح/خسارة${sortArrow('pnl')}</th>
           <th style="padding:10px 14px;text-align:right;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border-bottom:1px solid var(--border)">الوقف</th>
           <th colspan="3" style="padding:10px 14px;text-align:center;font-size:12px;color:var(--accent-green);background:var(--bg-secondary);border-bottom:1px solid var(--border)">🎯 الأهداف القريبة</th>
@@ -4641,14 +4639,18 @@ function renderTrades() {
               ${fmt(ep)} ج
               <div style="font-size:10px;color:var(--text-muted)">${tr.shares} سهم</div>
             </td>
-            <td style="padding:10px 14px">
-              ${pnlPct!=null ? `
-                <div class="${pnlClass}">${pnlPct>=0?'+':''}${pnlPct}%</div>
-                <div style="font-size:10px;color:${(pnlEgp||0)>=0?'var(--accent-green)':'var(--accent-red)'}">${(pnlEgp||0)>=0?'+':''}${(pnlEgp||0).toFixed(0)} ج</div>
-              ` : '<span class="muted">—</span>'}
-              <div style="font-size:9px;color:var(--text-muted);margin-top:2px">${fmt(curPrice)||'—'} ج حالياً</div>
+            <td style="padding:10px 14px;font-family:Rajdhani,sans-serif;font-weight:700">
+              ${fmt(curPrice)||'—'} ج
             </td>
-            <td style="padding:10px 14px;font-family:Rajdhani,sans-serif;font-size:12px;font-weight:700" class="red">${fmt(tr.stop_loss)||'—'}</td>
+            <td style="padding:10px 14px">
+              ${pnlEgp!=null ? `
+                <div class="${pnlClass}" style="font-size:14px">${pnlEgp>=0?'+':''}${pnlEgp.toFixed(0)} ج</div>
+                <div style="font-size:11px;color:${(pnlPct||0)>=0?'var(--accent-green)':'var(--accent-red)'}">${pnlPct>=0?'+':''}${pnlPct}%</div>
+              ` : '<span class="muted">—</span>'}
+            </td>
+            <td style="padding:10px 14px;font-family:Rajdhani,sans-serif;font-size:12px;font-weight:700" class="red">${fmt(tr.stop_loss)||'—'}
+              ${tr.stop_loss && ep ? `<div style="font-size:10px;font-weight:400;color:var(--accent-red)">${((tr.stop_loss-ep)/ep*100).toFixed(1)}%</div>` : ''}
+            </td>
             ${[nearT[0], nearT[1], nearT[2]].map(t => targetCell(t, ep)).join('')}
             ${[farT[0], farT[1], farT[2]].map(t => targetCell(t, ep)).join('')}
             <td style="padding:10px 14px;font-size:11px;color:var(--text-muted)">${tr.entry_date ? new Date(tr.entry_date).toLocaleString('ar-EG') : '—'}</td>
@@ -4846,7 +4848,51 @@ function renderBreadthBar() {
       <span>🕐 ${b.entry_time}</span>
     </div>
     ${b.warning ? `<div style="margin-top:8px;padding:6px 10px;background:rgba(246,173,85,0.08);border:1px solid rgba(246,173,85,0.2);border-radius:6px;font-size:12px;color:var(--accent-orange)">${b.warning}</div>` : ''}
+    ${b.time_prediction ? renderTimePrediction(b.time_prediction) : ''}
   </div>`;
+}
+
+function renderTimePrediction(tp) {
+  if (!tp) return '';
+  const intra = tp.intraday || {};
+  const td = tp.three_day || {};
+  const days = td.days || {};
+
+  const dirColor = (d) => {
+    if (d.includes('صعود') || d.includes('↑') || d.includes('📈')) return 'var(--accent-green)';
+    if (d.includes('هبوط') || d.includes('↓') || d.includes('📉')) return 'var(--accent-red)';
+    return 'var(--accent-orange)';
+  };
+
+  const intraBox = `
+    <div style="flex:1;min-width:200px;padding:10px;background:rgba(98,114,164,0.06);border-radius:6px">
+      <div style="font-size:11px;font-weight:700;margin-bottom:6px;color:var(--accent-cyan)">⏱️ تنبؤ داخل الجلسة</div>
+      <div style="font-size:13px;font-weight:700;color:${dirColor(intra.direction)}">${intra.direction}</div>
+      <div style="font-size:11px;margin-top:4px">ثقة: <b>${intra.confidence_pct}%</b></div>
+      <div style="font-size:11px;margin-top:2px">${intra.current_window || ''}</div>
+      <div style="font-size:11px;margin-top:2px">فيبوناتشي التالي: <b>${intra.next_fib_time}</b></div>
+    </div>`;
+
+  const daysHtml = Object.entries(days).map(([key, val]) => {
+    const label = key === 'day_1' ? 'اليوم 1' : key === 'day_2' ? 'اليوم 2' : 'اليوم 3';
+    return `<div style="flex:1;min-width:120px;padding:8px;background:rgba(98,114,164,0.04);border-radius:6px;text-align:center">
+      <div style="font-size:10px;font-weight:600;color:var(--text-muted);margin-bottom:2px">${label}</div>
+      <div style="font-size:12px;font-weight:700;color:${dirColor(val.direction)}">${val.direction}</div>
+      <div style="font-size:10px;margin-top:2px">ثقة ${val.confidence_pct}%</div>
+      <div style="font-size:10px;color:var(--text-muted)">${val.expected_range}</div>
+    </div>`;
+  }).join('');
+
+  const threeDayBox = `
+    <div style="flex:2;min-width:280px;padding:10px;background:rgba(98,114,164,0.06);border-radius:6px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span style="font-size:11px;font-weight:700;color:var(--accent-cyan)">📅 تنبؤ 3 أيام</span>
+        <span style="font-size:10px;color:var(--text-muted)">دورة جان: ${td.gann_cycle_readiness}</span>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">${daysHtml}</div>
+    </div>`;
+
+  return `<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">${intraBox}${threeDayBox}</div>`;
 }
 
 
@@ -4959,6 +5005,7 @@ async function saveAutoSettings() {
     min_rel_vol:         parseFloat(document.getElementById('set_minrelvol')?.value)  || 1.2,
     max_risk_pct:        parseFloat(document.getElementById('set_maxrisk')?.value)    || 8,
     max_consecutive_losses: parseInt(document.getElementById('set_maxconsec')?.value) || 3,
+    commission_pct:      parseFloat(document.getElementById('set_commission')?.value) || 0.6,
     auto_open:           document.getElementById('set_autoopen')?.dataset.val === 'true',
     auto_close:          document.getElementById('set_autoclose')?.dataset.val === 'true',
     test_mode:           document.getElementById('set_testmode')?.dataset.val === 'true',
@@ -5031,6 +5078,8 @@ function startAutoPoll() {
   if (_autoPollTimer) clearInterval(_autoPollTimer);
   setTimeout(pollAutoSignals, 5000);
   _autoPollTimer = setInterval(pollAutoSignals, 15000);
+  // نبض حياة كل دقيقتين عشان يحافظ على حالة "متصل الآن"
+  setInterval(() => { fetch('/api/ping').catch(()=>{}); }, 120000);
 }
 
 // ── Render Autopilot ──
@@ -5130,6 +5179,10 @@ function renderAutoSettings() {
     <div class="setting-row">
       <span class="setting-label">أقصى خسائر متتالية</span>
       <input class="setting-input" id="set_maxconsec" value="${s.max_consecutive_losses||3}" type="number" min="1">
+    </div>
+    <div class="setting-row">
+      <span class="setting-label">مصاريف تداول (جولة)</span>
+      <input class="setting-input" id="set_commission" value="${s.commission_pct!=null?s.commission_pct:0.6}" type="number" step="0.1"> %
     </div>
     <div class="setting-row">
       <span class="setting-label">فتح صفقات تلقائياً</span>

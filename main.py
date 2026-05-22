@@ -157,9 +157,17 @@ async def track_visits(request: Request, call_next):
     import time
     from database import log_visit
     path = request.url.path
-    # نسجل بس الصفحات الرئيسية مش طلبات API (عشان الـ polling مش يضخم الرقم)
-    if path in ("/", "/index.html"):
+    # استخراج IP حقيقي خلف proxy (X-Forwarded-For, X-Real-IP)
+    forwarded = request.headers.get("x-forwarded-for", "")
+    real_ip = request.headers.get("x-real-ip", "")
+    if forwarded:
+        ip = forwarded.split(",")[0].strip()
+    elif real_ip:
+        ip = real_ip.strip()
+    else:
         ip = request.client.host if request.client else "unknown"
+    # نسجل بس الصفحات الرئيسية + ping (عشان SPA)
+    if path in ("/", "/index.html", "/api/ping"):
         ua = request.headers.get("user-agent", "")
         try:
             log_visit(ip, ua, path)
